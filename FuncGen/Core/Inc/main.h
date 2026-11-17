@@ -49,8 +49,6 @@ extern "C" {
 
 /* USER CODE END EM */
 
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
-
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -63,12 +61,12 @@ void Error_Handler(void);
 #define SCOPE_CH1_GPIO_Port GPIOA
 #define SCOPE_CH2_Pin GPIO_PIN_1
 #define SCOPE_CH2_GPIO_Port GPIOA
-#define TEST_SINE_Pin GPIO_PIN_4
-#define TEST_SINE_GPIO_Port GPIOA
+#define GEN_CH1_Pin GPIO_PIN_4
+#define GEN_CH1_GPIO_Port GPIOA
 #define LD2_Pin GPIO_PIN_5
 #define LD2_GPIO_Port GPIOA
-#define TEST_SQUARE_Pin GPIO_PIN_6
-#define TEST_SQUARE_GPIO_Port GPIOA
+#define GEN_CH2_Pin GPIO_PIN_6
+#define GEN_CH2_GPIO_Port GPIOA
 #define CONTINUITY_Pin GPIO_PIN_0
 #define CONTINUITY_GPIO_Port GPIOB
 #define FREQ_IN_Pin GPIO_PIN_3

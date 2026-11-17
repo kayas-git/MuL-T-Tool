@@ -1,23 +1,25 @@
 # Function generator + oscilloscope on a NUCLEO-G474RE
 
 A **function generator** is the opposite of an oscilloscope: it does not
-measure signals, it **makes** them. This project turns pin **A2** of a
-NUCLEO-G474RE into a small function generator. The PC chooses the wave
-(**sine, square, triangle, sawtooth**, or a **custom** wave you draw with
-the mouse), the **frequency** (1 Hz to 10 kHz), the **amplitude** and the
-**offset** (DC level), all between 0 and 3.3 V.
+measure signals, it **makes** them. This project turns pins **A2** (CH1)
+and **D12** (CH2) of a NUCLEO-G474RE into a small **two-channel** function
+generator. For each channel the PC chooses the wave (**sine, square,
+triangle, sawtooth**, or a **custom** wave you draw with the mouse), the
+**frequency** (1 Hz to 10 kHz), the **amplitude** and the **offset** (DC
+level), all between 0 and 3.3 V. CH2 can also be **shifted in phase**
+against CH1 (for example 90°).
 
 It is a copy of the SCOPE project, so the 2-channel **oscilloscope** and the
-**multimeter** are still there. With **one jumper wire from A2 to A0** you
-watch the waves you make in the same window.
+**multimeter** are still there. With **two jumper wires, A2 → A0 and
+D12 → A1**, you watch the waves you make in the same window.
 
 > ## ⚠️ SAFETY: 0 V to 3.3 V ONLY
 > Every input pin goes **straight into the STM32 chip**. There is no
 > protection at all. **Never** connect mains (230 V / 110 V), a car battery,
 > a 5 V / 9 V / 12 V supply, a phone charger output, or anything negative.
 > Doing that can destroy the board **and the USB port of your PC**.
-> The generator output A2 only makes 0 to 3.3 V. Don't connect it to
-> another output, or to anything that has its own supply.
+> The generator outputs A2 and D12 only make 0 to 3.3 V. Don't connect
+> them to another output, or to anything that has its own supply.
 
 ![A 500 Hz triangle wave made by the generator, shown by the scope](docs/screenshot.png)
 
@@ -31,12 +33,14 @@ picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
 ```
  PC: "triangle, 500 Hz, 2.5 V, 1.65 V" ──USB──► board fills a table (100 values)
                                                      │
-              TIM7 ticks ──► DMA copies the next value ──► DAC ──► A2 ──wire──► A0 (scope)
+              TIM7 ticks ──► DMA copies the next value ──► DAC1 ──► A2  ──wire──► A0 (scope CH1)
+  TIM3 (or TIM7) ticks ──► DMA copies the next value ──► DAC2 ──► D12 ──wire──► A1 (scope CH2)
 ```
 
 ## What it can do
 
-**Function generator** (output A2)
+**Function generator** (CH1 on A2, CH2 on D12; each channel has all of
+the settings below, and its own **on/off**)
 - Waves: **sine, square, triangle, sawtooth, custom** (one period you
   draw with the mouse, see [Draw your own wave](#draw-your-own-wave-d)).
 - Frequency: **1 Hz to 10 000 Hz**, in steps of 1 Hz. The board makes the
@@ -46,8 +50,12 @@ picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
 - Amplitude (peak to peak) and offset (the middle level): **0 to 3.3 V**,
   in steps of 1 mV. If the wave would go below 0 V or above the supply, it
   is cut flat ("clipped") and the window says **CLIPPED**.
-- Start-up setting: sine, 1 kHz, 2.0 V peak to peak, offset 1.65 V
-  (from 0.65 V to 2.65 V).
+- **CH2 phase** 0 … 359° against CH1, in steps of 3.6°, while CH2 is
+  **coupled** to CH1 (same frequency). Uncoupled, CH2 has its own frequency
+  (see [Two channels, phase and coupling](#two-channels-phase-and-coupling)).
+- Start-up setting: CH1 sine, 1 kHz, 2.0 V peak to peak, offset 1.65 V
+  (from 0.65 V to 2.65 V). CH2 the same, but **off** (0 V) and coupled with
+  phase 0°.
 
 **Oscilloscope** (A0 and A1) and **multimeter** (volts and Ω on A0,
 frequency on D3, continuity on A3): as in SCOPE. 1 kS/s to 2 MS/s,
@@ -55,41 +63,44 @@ trigger with Auto / Normal / Single. New: **automatic measurements** for
 each channel (Vpp, min, max, average, RMS, frequency) and **cursors** you
 drag with the mouse.
 
-**Extra test signal: D12**, a 2 kHz square, 0 / 3.3 V, high 25 % of the time.
-
 ## Pins
 
 All of them are on the Arduino-style headers of the Nucleo.
 
 | Nucleo pin | Chip pin | Use |
 |------------|----------|-----|
-| **A2**     | PA4      | **Generator output** (DAC) |
+| **A2**     | PA4      | **Generator CH1 output** (DAC1) |
+| **D12**    | PA6      | **Generator CH2 output** (DAC2) |
 | **A0**     | PA0      | Scope CH1, voltmeter and ohmmeter input |
 | **A1**     | PA1      | Scope CH2 |
 | **D3**     | PB3      | Frequency / duty cycle input |
 | **A3**     | PB0      | Continuity probe (other probe: **GND**) |
-| **D12**    | PA6      | Test output: 2 kHz square |
 | 3V3        | –        | 3.3 V (only for the ohmmeter's known resistor) |
 | GND        | –        | Ground (several GND pins on the headers) |
 
 LED LD2 blinks each time a packet goes to the PC: "I'm alive".
 
-## Try it (1 jumper wire)
+## Try it (2 jumper wires)
 
 ```
-   A2 (generator) ───wire───► A0 (scope CH1)
+   A2  (generator CH1) ───wire───► A0 (scope CH1)
+   D12 (generator CH2) ───wire───► A1 (scope CH2)
 ```
 
 Then start the PC window (below). Press **G** to change the wave and
 **[** / **]** to change the frequency. You see the result on the scope at
-once. Optional second wire: **D12 → A1** to show the fixed 2 kHz square on
-CH2 for comparison.
+once. These keys change CH1; press **Y** to change CH2 instead, and **X**
+to switch it on.
 
 Ideas to try:
+- **Y**, **X** (CH2 on), **P** `90` **Enter**: two sines a quarter period
+  apart, like the screenshot in
+  [Two channels, phase and coupling](#two-channels-phase-and-coupling).
 - Press **F**, type `440`, **Enter**: the note A. The window says
   "real 439.959 Hz". Why not 440? See the next section.
 - Make a square wave from 0 V to 3.3 V (**A** `3.3`, **O** `1.65`) and wire
-  A2 → **D3**. Press **M**: the frequency counter measures your generator.
+  A2 (or D12, if that channel makes the square) → **D3**. Press **M**: the
+  frequency counter measures your generator.
 - Set the offset to 3.0 V with 2 V amplitude: the top is cut off at the
   supply (CLIPPED). A real generator does the same at its limits.
 
@@ -173,28 +184,78 @@ the COM port at a time.
 
 ## Controls
 
-**Generator** (the green lines under the scope show the settings)
+**Generator** (the green lines under the scope show both channels; `< Y`
+marks the one the keys change)
 
 | Key | Does |
 |-----|------|
+| **Y** | Choose the channel the generator keys change: CH1 (A2) ↔ CH2 (D12) |
+| **X** | That channel's output on / off (off = 0 V) |
 | **G** | Next wave: sine → square → triangle → sawtooth → custom → sine |
 | **D** | Draw your own wave with the mouse (see below) |
 | **[** / **]** | Frequency down / up in 1-2-5 steps (1, 2, 5, 10, 20, 50, ... 10 000 Hz) |
 | **F** | Type a frequency in Hz, then **Enter** (1 to 10 000) |
 | **A** | Type the amplitude in volts peak to peak, then **Enter** (0 to 3.3) |
 | **O** | Type the offset (middle level) in volts, then **Enter** (0 to 3.3) |
+| **P** | Type CH2's phase in degrees, then **Enter** (0 to 359) |
+| **L** | CH2 coupled to CH1 (same frequency, phase works) or not (own frequency) |
+| **R** | Align: restart both channels together |
 | Esc | While typing: cancel. Backspace deletes a digit |
 
 Out-of-range numbers are set to the nearest limit. The panel shows:
 
 ```
-GENERATOR (A2): TRIANGLE  2.50 Vpp  offset 1.65 V
-asked 500 Hz, real 500 Hz (+0.000 %)   DAC: 50 kvalues/s
-real = 170 MHz / (PSC+1) / (ARR+1) / points = 170 MHz / 1 / 3400 / 100
+GEN CH1 (A2) ON  TRIANGLE  2.50 Vpp  offset 1.65 V
+  asked 500 Hz, real 500 Hz (+0.000 %) = 170 MHz/1/3400/100
+GEN CH2 (D12) ON  SINE  2.00 Vpp  offset 1.65 V  < Y
+  coupled to CH1 (L)   phase 90 deg -> real 90.0 deg (steps of 3.6)
 ```
+
+The last number in "170 MHz/1/3400/100" is the table size; the others are
+PSC + 1 and ARR + 1 (see the formula above). While CH2 is coupled, its
+frequency is CH1's, so its line shows the phase instead.
 
 A new setting is used at the start of the board's next capture. At slow
 time/div (50 ms/div) that can take up to a second.
+
+### Two channels, phase and coupling
+
+![CH1 and CH2: 1 kHz sines, CH2 90° ahead](docs/screenshot_dual.png)
+
+*(Real data from the board: both channels make a 1 kHz sine, 2 Vpp around
+1.65 V, with CH2 (cyan) set to 90°. CH2 reaches its top a quarter period
+(0.25 ms) **before** CH1 (yellow): it is 90° **ahead**. Wires A2 → A0 and
+D12 → A1. The samples were read out of the board through the debugger,
+because another program had the COM port, and drawn by this window.)*
+
+Each channel has its own wave, frequency, amplitude, offset, on/off and
+custom drawing. **Y** chooses which one the generator keys change.
+
+**Coupled** (the default, **L** switches): CH2 uses CH1's timer, so it
+always has exactly CH1's frequency (its own frequency setting is kept for
+later, but not used). Now **P** can shift CH2: its table simply starts
+somewhere else. With 90°, CH2 starts at point 25 of its 100 (90 / 360 × 100
+= 25). One point = 360° / 100 = **3.6°**, so the phase is rounded to the
+nearest 3.6° (45° becomes 46.8°; the window shows the real value). This is
+how real two-channel generators work too.
+
+**Not coupled**: CH2 has its own timer and frequency. Two different
+frequencies keep sliding past each other, so a phase means nothing: the
+window shows "phase n/a". Even two "equal" frequencies drift a little.
+
+**R** (align) restarts both channels at the same moment. Any change to
+either channel does that too, so CH1 hiccups briefly when you change CH2.
+
+Phase measured on this board (CH1 and CH2 1 kHz sines, coupled; phase
+from fitting a sine to 1000 samples of each channel):
+
+| Set | Board makes | Measured |
+|----:|------------:|---------:|
+| 0° | 0.0° | 0.0° |
+| 45° | 46.8° | 46.8° |
+| 90° | 90.0° | 90.0° |
+| 180° | 180.0° | 180.0° |
+| 270° | 270.0° | 270.0° |
 
 ### Draw your own wave (D)
 
@@ -205,7 +266,8 @@ time/div (50 ms/div) that can take up to a second.
 2. Hold the **left mouse button** and draw **one period**, from left to
    right. You can go over parts again. **C** starts from a flat line.
 3. Press **Enter**: the window turns your drawing into 100 points, sends
-   them to the board, and switches the generator to **custom**.
+   them to the board, and switches the generator to **custom**. (This is for
+   the channel chosen with **Y**; each channel keeps its own drawing.)
    **Esc** cancels and keeps the old wave.
 
 **Amplitude and offset still work** on a drawn wave: the top of the
@@ -323,8 +385,9 @@ measures it at start-up and scales the table to it.
 - The output can't drive much current. Connect it to inputs (like A0), not
   to a speaker or an LED without a resistor of at least 1 kΩ.
 - The output reaches about 0.04 V at the bottom, not exactly 0 V.
-- When you change a setting, the wave stops for a moment and restarts at
-  the beginning of the table.
+- When you change a setting, both channels stop for a moment and restart
+  at the beginning of their tables (that keeps the phase right).
+- CH2's phase only works while it is coupled to CH1, in steps of 3.6°.
 - Frequency accuracy: the formula is exact; the chip's clock is ±1 %.
 - A drawn wave has 100 points with 256 levels each (0 … 255). Sharp jumps
   in a drawing are fine, but a fast mouse can't draw finer detail than
@@ -340,16 +403,17 @@ FUNCGEN/
 ├── README.md                     this file
 ├── HOW_IT_WORKS.md               the code, explained step by step
 ├── docs/screenshot.png           triangle on the scope (screenshot_sawtooth.png: sawtooth,
-│                                 screenshot_draw.png / screenshot_custom.png: a drawn wave)
+│                                 screenshot_draw.png / screenshot_custom.png: a drawn wave,
+│                                 screenshot_dual.png: CH1 and CH2 90° apart)
 ├── pc_app/
 │   ├── funcgen_window.py         the PC window (pygame): scope, meter, cursors, generator panel, drawing
 │   └── requirements.txt
 └── FuncGen/                      STM32CubeIDE project
-    ├── FuncGen.ioc               CubeMX settings (pins, ADCs, DAC, timers, DMA, UART)
+    ├── FuncGen.ioc               CubeMX settings (pins, ADCs, DACs, timers, DMA, UART)
     └── Core/
         ├── Src/main.c            generated; our lines are in USER CODE
-        ├── Src/generator.c       NEW: table -> DMA -> DAC, timer maths, custom wave
+        ├── Src/generator.c       NEW: 2 channels: table -> DMA -> DAC, timer maths, phase
         ├── Inc/generator.h       NEW: wave names and limits
-        ├── Src/scope.c           capture + measure + send; receives 'G' and 'W' commands
+        ├── Src/scope.c           capture + measure + send; receives 'G', 'W' and 'P' commands
         └── Inc/scope.h
 ```

@@ -1,19 +1,21 @@
 """funcgen_window.py - the PC screen of the NUCLEO-G474RE function
 generator (+ oscilloscope and multimeter, to watch what it makes).
 
-The board makes a wave on A2, measures and sends packets (about 10 to 90
-per second). This script only:
+The board makes two waves (generator CH1 on A2, CH2 on D12), measures and
+sends packets (about 10 to 90 per second). This script only:
   1. finds the board's COM port,
   2. reads the packets (2 channels of samples + multimeter readings +
      the generator's settings),
   3. draws them: an oscilloscope screen, or big multimeter numbers, and
      the generator's settings with its real frequency,
-  4. sends the chosen sample rate (one byte), generator settings
-     ('G' + 10 bytes) and a drawn wave shape ('W' + 101 bytes) to the board.
+  4. sends the chosen sample rate (one byte), a generator channel's
+     settings ('G' + 12 bytes), a drawn wave shape ('W' + 102 bytes) and
+     CH2's phase + coupling ('P' + 4 bytes) to the board.
 
 Extras: K shows two time + two voltage cursors (drag them with the mouse);
 press K again for "track" mode, where the voltage cursors follow the wave.
 D lets you draw one period of a "custom" wave with the mouse.
+Y chooses which generator channel the generator keys change.
 
 INPUTS: 0 V to 3.3 V ONLY. Never connect mains, car or other batteries,
 or anything negative. That can destroy the board and your PC's USB port.
@@ -34,7 +36,7 @@ from serial.tools import list_ports
 
 BAUD = 4250000                # must match USART2 in the board's FuncGen.ioc
 START = b"\xA5\x5A"           # every packet starts with these 2 bytes
-HEADER = 35                   # bytes before the samples (see scope.c)
+HEADER = 54                   # bytes before the samples (see scope.c)
 TIMER_HZ = 170_000_000        # TIM2 (frequency counter) and TIM7 count this fast
 
 # The generator (generator.h). The PC uses the same limits as the board.
@@ -46,6 +48,8 @@ STAIRS = [(i // 25) * 85 for i in range(POINTS)]
 GEN_MIN_HZ, GEN_MAX_HZ, GEN_MAX_V = 1, 10000, 3.3
 GEN_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
 GEN_COLOR = (120, 255, 140)
+GEN_PINS = ["A2", "D12"]      # generator CH1 and CH2 outputs
+GEN_KEYS = ("wave", "freq", "amp", "offset", "on")   # one channel's settings
 CURSOR_COLOR = (230, 120, 255)
 
 # The board's sample rates (RATES[] in scope.c). We send the index.
@@ -61,7 +65,7 @@ GW, GH = DIV_X * DIVS_X, DIV_Y * DIVS_Y
 SHOWN = 500                               # samples across the screen
 PRE_TRIGGER = 100                         # samples shown before the trigger (20 %)
 AFTER_TRIGGER = SHOWN - PRE_TRIGGER       # samples shown from the trigger on
-WIDTH, HEIGHT = GX + GW + 280, GY + GH + 190
+WIDTH, HEIGHT = GX + GW + 280, GY + GH + 210
 
 # Trigger modes, like a real oscilloscope (Tab switches between them):
 #   Auto   - draw every capture; use the trigger when there is one.
@@ -83,6 +87,16 @@ def find_port():
     return None
 
 
+def read_channel(buffer, offset, points):
+    """One generator channel in the packet: 15 bytes (put_channel() in
+    scope.c)."""
+    wave, on, freq, psc, arr, amp_mv, offset_mv, shape = \
+        struct.unpack_from("<BBIHHHHB", buffer, offset)
+    return {"wave": wave, "on": on, "freq": freq, "amp": amp_mv / 1000,
+            "offset": offset_mv / 1000, "psc": psc, "arr": arr,
+            "points": points, "shape": shape}
+
+
 def read_packets(buffer):
     """Take all complete, good packets out of `buffer` (removing the bytes).
     Each packet becomes a dict."""
@@ -96,8 +110,8 @@ def read_packets(buffer):
             del buffer[:start]
             return packets                  # wait for the rest
         rate, n, vdda_mv, period, high, continuity, counter, \
-            wave, points, freq, psc, arr, amp_mv, offset_mv, shape = \
-            struct.unpack_from("<IHHIIBBBBIHHHHB", buffer, start + 2)
+            points, phase, coupled = \
+            struct.unpack_from("<IHHIIBBBHB", buffer, start + 2)
         size = HEADER + 4 * n + 2
         if n > 5000:                        # nonsense: not a real packet
             del buffer[:start + 1]
@@ -121,9 +135,10 @@ def read_packets(buffer):
             "duty": 100 * high / period if period else 0.0,
             "continuity": bool(continuity),
             "counter": counter,             # +1 for every packet the board sends
-            "gen": {"wave": wave, "freq": freq, "amp": amp_mv / 1000,
-                    "offset": offset_mv / 1000, "psc": psc, "arr": arr,
-                    "points": points, "shape": shape},
+            # The generator: both channels, then CH2's phase and coupling.
+            "gen": [read_channel(buffer, start + 24 + 15 * ch, points)
+                    for ch in (0, 1)],
+            "phase": phase, "coupled": coupled,
         })
         del buffer[:start + size]
 
@@ -217,18 +232,36 @@ def real_frequency(gen):
     return values_per_s / gen["points"], values_per_s
 
 
-def generator_command(wave, freq, amp, offset):
-    """The 11 bytes that change the generator (see scope.c):
-    'G', wave, frequency Hz (4 bytes), amplitude mV (2), offset mV (2),
-    check = the 9 bytes after 'G' added up (low 8 bits)."""
-    body = struct.pack("<BIHH", wave, freq, round(amp * 1000), round(offset * 1000))
+def generator_command(ch, g):
+    """The 13 bytes that change one generator channel (see scope.c):
+    'G', channel (0 = CH1, 1 = CH2), wave, frequency Hz (4 bytes),
+    amplitude mV (2), offset mV (2), on (1),
+    check = the 11 bytes after 'G' added up (low 8 bits)."""
+    body = struct.pack("<BBIHHB", ch, g["wave"], g["freq"], round(g["amp"] * 1000),
+                       round(g["offset"] * 1000), g["on"])
     return b"G" + body + bytes([sum(body) & 0xFF])
 
 
-def shape_command(shape):
-    """The 102 bytes that send a drawn wave (see scope.c): 'W', the 100
-    shape points (0 = bottom .. 255 = top), check = the 100 added up."""
-    return b"W" + bytes(shape) + bytes([sum(shape) & 0xFF])
+def shape_command(ch, shape):
+    """The 103 bytes that send a drawn wave (see scope.c): 'W', channel,
+    the 100 shape points (0 = bottom .. 255 = top), check = the 101 added up."""
+    body = bytes([ch]) + bytes(shape)
+    return b"W" + body + bytes([sum(body) & 0xFF])
+
+
+def phase_command(phase, coupled):
+    """The 5 bytes that set CH2's phase (degrees) and coupling: 'P',
+    phase (2 bytes), coupled (1), check. The board restarts both channels
+    together, so sending it again "aligns" them."""
+    body = struct.pack("<HB", phase, coupled)
+    return b"P" + body + bytes([sum(body) & 0xFF])
+
+
+def real_phase(phase):
+    """The phase the board really makes: CH2's table is turned by a whole
+    number of points, phase x 100 / 360 rounded, and 1 point = 3.6 degrees."""
+    shift = int(phase * POINTS / 360 + 0.5) % POINTS   # half up, like generator.c
+    return shift * 360 / POINTS
 
 
 def measurements(signal, rate):
@@ -289,14 +322,16 @@ class Window:
         self.view = None                    # what the scope screen shows
         self.found_trigger = False          # did the newest packet trigger?
         self.packet_times = []
-        # Generator settings we want. None until the first packet tells us
-        # what the board is doing now.
+        # Generator settings we want: a list of 2 dicts (CH1, CH2). None
+        # until the first packet tells us what the board is doing now.
         self.gen = None
+        self.pair = None                    # {"phase": degrees, "coupled": 0/1}
+        self.edit = 0                       # the channel the generator keys change
         self.gen_sent_ms = 0                # when we last sent them
         self.entry = None                   # typing a number: ("F", "440")
-        # The custom wave's shape (100 numbers, 0..255), and the shape being
-        # drawn (a list of 100 numbers while in drawing mode, else None).
-        self.custom = list(STAIRS)
+        # Each channel's custom shape (100 numbers, 0..255), and the shape
+        # being drawn (a list of 100 numbers while in drawing mode, else None).
+        self.custom = [list(STAIRS), list(STAIRS)]
         self.drawing = None
         self.last_drawn = None              # last point the mouse drew
         # Cursors (K): 2 time cursors, as a sample position on the screen
@@ -316,43 +351,60 @@ class Window:
         self.link.write(bytes([index]))
         self.rate_sent_ms = pygame.time.get_ticks()
 
-    def send_generator(self, with_shape=False):
-        """Send the settings ('G'). with_shape: first send our custom shape
-        ('W'), so a following 'G' with the custom wave plays it."""
-        g = self.gen
+    def send_generator(self, ch, with_shape=False):
+        """Send one channel's settings ('G'). with_shape: first send its
+        custom shape ('W'), so a following 'G' with the custom wave plays it."""
+        g = self.gen[ch]
         if with_shape:
-            self.link.write(shape_command(self.custom))
-            g["shape"] = sum(self.custom) & 0xFF
-        self.link.write(generator_command(g["wave"], g["freq"], g["amp"], g["offset"]))
+            self.link.write(shape_command(ch, self.custom[ch]))
+            g["shape"] = sum(self.custom[ch]) & 0xFF
+        self.link.write(generator_command(ch, g))
+        self.gen_sent_ms = pygame.time.get_ticks()
+
+    def send_phase(self):
+        """Send CH2's phase and coupling ('P'); also restarts both together."""
+        self.link.write(phase_command(self.pair["phase"], self.pair["coupled"]))
         self.gen_sent_ms = pygame.time.get_ticks()
 
     def check_generator(self, packet):
         """Take over the board's settings at the start. Later, if the board
         does not show ours (a lost command, or the board was reset), send
         them again, at most once a second. The shape only matters while the
-        custom wave plays."""
-        board = packet["gen"]
+        custom wave plays.
+        Only ONE 'G' per check: the board has one buffer for 'G', so a
+        second 'G' sent at once could overwrite the first before it is used.
+        The other channel is fixed a second later."""
         if self.gen is None:
-            self.gen = {k: board[k] for k in ("wave", "freq", "amp", "offset", "shape")}
+            self.gen = [{k: b[k] for k in GEN_KEYS + ("shape",)} for b in packet["gen"]]
+            self.pair = {"phase": packet["phase"], "coupled": packet["coupled"]}
             return
-        keys = ["wave", "freq", "amp", "offset"]
-        if self.gen["wave"] == CUSTOM:
-            keys.append("shape")
-        wrong = [k for k in keys if abs(self.gen[k] - board[k]) > 0.0005]
-        if wrong and pygame.time.get_ticks() - self.gen_sent_ms > 1000:
-            self.send_generator(with_shape="shape" in wrong)
+        if pygame.time.get_ticks() - self.gen_sent_ms <= 1000:
+            return
+        for ch, board in enumerate(packet["gen"]):
+            keys = list(GEN_KEYS)
+            if self.gen[ch]["wave"] == CUSTOM:
+                keys.append("shape")
+            wrong = [k for k in keys if abs(self.gen[ch][k] - board[k]) > 0.0005]
+            if wrong:
+                self.send_generator(ch, with_shape="shape" in wrong)
+                break
+        if (packet["phase"], packet["coupled"]) != (self.pair["phase"], self.pair["coupled"]):
+            self.send_phase()
 
     def change_generator(self, **changes):
+        """Change the channel being edited (Y chooses it), and send it."""
         if self.gen is None:
             return                          # no packet yet: we don't know it
-        self.gen.update(changes)
-        # With the custom wave, send its shape too (102 more bytes: cheap).
-        self.send_generator(with_shape=self.gen["wave"] == CUSTOM)
+        g = self.gen[self.edit]
+        g.update(changes)
+        # With the custom wave, send its shape too (103 more bytes: cheap).
+        self.send_generator(self.edit, with_shape=g["wave"] == CUSTOM)
 
     # ---- typing a number (F, A, O) ----
     ENTRY_TEXT = {"F": f"frequency in Hz ({GEN_MIN_HZ} .. {GEN_MAX_HZ})",
                   "A": f"amplitude in volts peak-to-peak (0 .. {GEN_MAX_V})",
-                  "O": f"offset (middle level) in volts (0 .. {GEN_MAX_V})"}
+                  "O": f"offset (middle level) in volts (0 .. {GEN_MAX_V})",
+                  "P": "CH2 phase in degrees (0 .. 359)"}
 
     def entry_key(self, event):
         what, text = self.entry
@@ -369,6 +421,9 @@ class Window:
             if what == "F":
                 freq = round(min(max(value, GEN_MIN_HZ), GEN_MAX_HZ))
                 self.change_generator(freq=freq)
+            elif what == "P":                 # whole degrees, 0 .. 359
+                self.pair["phase"] = round(value) % 360
+                self.send_phase()
             elif what == "A":                 # (round to mV, like the board)
                 self.change_generator(amp=round(min(max(value, 0.0), GEN_MAX_V), 3))
             else:
@@ -380,11 +435,11 @@ class Window:
     def draw_key(self, event):
         """Keys while drawing: Enter = send it, Esc = cancel, C = flat."""
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self.custom = [round(v) for v in self.drawing]
+            self.custom[self.edit] = [round(v) for v in self.drawing]
             self.drawing = None
             if self.gen is not None:        # play it: 'W' (shape) + 'G' (custom)
-                self.gen["wave"] = CUSTOM
-                self.send_generator(with_shape=True)
+                self.gen[self.edit]["wave"] = CUSTOM
+                self.send_generator(self.edit, with_shape=True)
         elif event.key == pygame.K_ESCAPE:
             self.drawing = None             # cancel: keep the old shape
         elif event.key == pygame.K_c:
@@ -452,20 +507,32 @@ class Window:
             self.draw_key(event)
             return
         k = event.key
+        g = self.gen[self.edit] if self.gen else None   # the edited channel
         if k == pygame.K_d:                 # draw a wave, starting from the last one
-            self.drawing = [float(v) for v in self.custom]
+            self.drawing = [float(v) for v in self.custom[self.edit]]
+        elif k == pygame.K_y:               # edit the other generator channel
+            self.edit = 1 - self.edit
+        elif k == pygame.K_x and g:         # edited channel's output on/off
+            self.change_generator(on=1 - g["on"])
+        elif k == pygame.K_l and g:         # CH2 coupled to CH1 or not
+            self.pair["coupled"] = 1 - self.pair["coupled"]
+            self.send_phase()
+        elif k == pygame.K_r and g:         # align: restart both together
+            self.send_phase()
+        elif k == pygame.K_p and g:         # type CH2's phase
+            self.entry = ("P", "")
         elif k == pygame.K_k:               # cursors: off -> manual -> track -> off
             modes = ["off", "manual", "track"]
             self.cursor_mode = modes[(modes.index(self.cursor_mode) + 1) % 3]
-        elif k == pygame.K_g and self.gen:  # next wave shape
-            self.change_generator(wave=(self.gen["wave"] + 1) % len(WAVES))
-        elif k == pygame.K_RIGHTBRACKET and self.gen:   # next step up
-            higher = [f for f in GEN_STEPS if f > self.gen["freq"]]
+        elif k == pygame.K_g and g:         # next wave shape
+            self.change_generator(wave=(g["wave"] + 1) % len(WAVES))
+        elif k == pygame.K_RIGHTBRACKET and g:          # next step up
+            higher = [f for f in GEN_STEPS if f > g["freq"]]
             self.change_generator(freq=higher[0] if higher else GEN_MAX_HZ)
-        elif k == pygame.K_LEFTBRACKET and self.gen:    # next step down
-            lower = [f for f in GEN_STEPS if f < self.gen["freq"]]
+        elif k == pygame.K_LEFTBRACKET and g:           # next step down
+            lower = [f for f in GEN_STEPS if f < g["freq"]]
             self.change_generator(freq=lower[-1] if lower else GEN_MIN_HZ)
-        elif k in (pygame.K_f, pygame.K_a, pygame.K_o) and self.gen:
+        elif k in (pygame.K_f, pygame.K_a, pygame.K_o) and g:
             self.entry = (pygame.key.name(k).upper(), "")
         elif k == pygame.K_m:
             self.meter_mode = not self.meter_mode
@@ -641,18 +708,10 @@ class Window:
                 x, y = GX + i * GW / SHOWN, self.y_of(signal[i])
                 pygame.draw.polygon(self.screen, CURSOR_COLOR,
                                     [(x, y + tip), (x - 6, y + base), (x + 6, y + base)])
-        for i, line in enumerate(lines):
-            self.text(line, GX + 10, GY + 18 + 20 * i, CURSOR_COLOR)
-        if peaks:
-            # Drawn last, so the box can't hide them: a triangle above the
-            # highest sample (tip down) and one below the lowest (tip up).
-            for i, tip, base in ((i_max, -4, -14), (i_min, 4, 14)):
-                x, y = GX + i * GW / SHOWN, self.y_of(signal[i])
-                pygame.draw.polygon(self.screen, CURSOR_COLOR,
-                                    [(x, y + tip), (x - 6, y + base), (x + 6, y + base)])
 
     def draw_canvas(self):
-        """Drawing mode (D): the screen is one period of the custom wave.
+        """Drawing mode (D): the screen is one period of the edited channel's
+        custom wave.
         Left = start, right = end, top = offset + amplitude/2, bottom =
         offset - amplitude/2."""
         for i in range(DIVS_X + 1):
@@ -662,13 +721,14 @@ class Window:
         points = [(GX + i * GW / (POINTS - 1), GY + GH - v / 255 * GH)
                   for i, v in enumerate(self.drawing)]
         pygame.draw.lines(self.screen, GEN_COLOR, False, points, 3)
-        g = self.gen
+        g = self.gen[self.edit] if self.gen else None
         top = f"{g['offset'] + g['amp'] / 2:.2f} V" if g else "top"
         bottom = f"{g['offset'] - g['amp'] / 2:.2f} V" if g else "bottom"
         self.text(f"top = {top}", GX + 6, GY + 4, GEN_COLOR)
         self.text(f"bottom = {bottom}", GX + 6, GY + GH - 20, GEN_COLOR)
         y = GY + GH + 10
-        self.text("DRAWING one period of the custom wave (100 points):", GX, y, GEN_COLOR)
+        self.text(f"DRAWING one period of the CH{self.edit + 1} custom wave (100 points):",
+                  GX, y, GEN_COLOR)
         self.text("hold the left mouse button and draw from left to right.", GX, y + 22, GEN_COLOR)
         self.text("Enter = send it to the board   C = flat line   Esc = cancel",
                   GX, y + 42, (255, 255, 0))
@@ -693,28 +753,39 @@ class Window:
             self.text(value, GX + 20, GY + 25 + i * 95, color, self.big)
 
     def draw_generator(self, p):
-        """Three lines under the screen: the generator's settings, its real
-        frequency (and how it is made), and the typing prompt."""
+        """Under the screen: two lines per generator channel (settings, then
+        the real frequency and how it is made), and the typing prompt.
+        "<" marks the channel the generator keys change (Y)."""
         x, y = GX, GY + GH + 72
         if p is None:
             return
-        g = p["gen"]
-        real, values_per_s = real_frequency(g)
-        error = 100 * (real - g["freq"]) / g["freq"]
-        low, high = g["offset"] - g["amp"] / 2, g["offset"] + g["amp"] / 2
-        clipped = ""
-        if low < 0 or high > p["vdda"]:
-            clipped = f"  CLIPPED (the DAC can only do 0 .. {p['vdda']:.2f} V)"
-        self.text(f"GENERATOR (A2): {WAVES[g['wave']].upper()}  {g['amp']:.2f} Vpp"
-                  f"  offset {g['offset']:.2f} V{clipped}", x, y, GEN_COLOR)
-        self.text(f"asked {g['freq']} Hz, real {real:.6g} Hz ({error:+.3f} %)"
-                  f"   DAC: {nice(values_per_s, 'values/s')}", x, y + 20, GEN_COLOR)
-        self.text(f"real = 170 MHz / (PSC+1) / (ARR+1) / points = 170 MHz / "
-                  f"{g['psc'] + 1} / {g['arr'] + 1} / {g['points']}", x, y + 40, GEN_COLOR)
+        for ch, g in enumerate(p["gen"]):
+            yc = y + 40 * ch
+            color = GEN_COLOR if g["on"] else GREY
+            low, high = g["offset"] - g["amp"] / 2, g["offset"] + g["amp"] / 2
+            clipped = ""
+            if g["on"] and (low < 0 or high > p["vdda"]):
+                clipped = f"  CLIPPED (DAC: 0 .. {p['vdda']:.2f} V)"
+            edit = "  < Y" if ch == self.edit else ""
+            self.text(f"GEN CH{ch + 1} ({GEN_PINS[ch]}) {'ON ' if g['on'] else 'OFF'} "
+                      f"{WAVES[g['wave']].upper()}  {g['amp']:.2f} Vpp  offset "
+                      f"{g['offset']:.2f} V{clipped}{edit}", x, yc, color)
+            if ch == 1 and p["coupled"]:
+                # Same timer as CH1, so same frequency; the phase is real.
+                self.text(f"  coupled to CH1 (L)   phase {p['phase']} deg -> real "
+                          f"{real_phase(p['phase']):.1f} deg (steps of 3.6)",
+                          x, yc + 20, color)
+                continue
+            real, values_per_s = real_frequency(g)
+            error = 100 * (real - g["freq"]) / g["freq"]
+            phase = "   phase n/a (not coupled)" if ch == 1 else ""
+            self.text(f"  asked {g['freq']} Hz, real {real:.6g} Hz ({error:+.3f} %) "
+                      f"= 170 MHz/{g['psc'] + 1}/{g['arr'] + 1}/{g['points']}{phase}",
+                      x, yc + 20, color)
         if self.entry is not None:
             what, text = self.entry
             self.text(f"Type the {self.ENTRY_TEXT[what]}, Enter = OK, Esc = cancel:  "
-                      f"{text}_", x, y + 62, (255, 255, 0))
+                      f"{text}_", x, y + 82, (255, 255, 0))
 
     def draw_panel(self, p):
         x, y = GX + GW + 25, GY
@@ -730,15 +801,17 @@ class Window:
                   "S           arm Single", "C           clear screen",
                   "1 / 2       show/hide CH", "K           cursors/track",
                   "Space       pause", "F12         screenshot", "",
-                  "Generator keys (A2):", "G           wave shape",
+                  f"Generator keys (CH{self.edit + 1}):", "Y           edit CH1/CH2",
+                  "X           output on/off", "G           wave shape",
                   "[ / ]       frequency -/+", "F           type frequency",
                   "A           type amplitude", "O           type offset",
-                  "D           draw a wave", "",
+                  "D           draw a wave", "P           type CH2 phase",
+                  "L           CH2 coupling", "R           align (restart)", "",
                   "Pins:", "A0 = CH1 / volts / ohms", "A1 = CH2",
                   "D3 = frequency counter", "A3 = continuity probe",
-                  "A2 = GENERATOR output", "D12 = 2 kHz square"]
+                  "A2 = generator CH1", "D12 = generator CH2"]
         for i, line in enumerate(lines):
-            self.text(line, x, y + 26 + i * 19, GREY)
+            self.text(line, x, y + 26 + i * 17, GREY)
         self.text(WARNING, GX, HEIGHT - 26, RED)
 
     def update_beep(self):

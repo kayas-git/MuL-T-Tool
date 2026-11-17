@@ -9,10 +9,11 @@
  *   4. send one packet to the PC (it includes the generator's settings).
  * The PC window does the rest (trigger, drawing, multimeter numbers).
  *
- * The PC sends us three kinds of messages:
+ * The PC sends us four kinds of messages:
  *   - one byte 0..10: the new sample rate (an index into RATES[] below),
- *   - 'G' + 10 bytes: new generator settings,
- *   - 'W' + 101 bytes: a new custom wave shape (drawn on the PC).
+ *   - 'G' + 12 bytes: new settings for one generator channel,
+ *   - 'W' + 102 bytes: a new custom wave shape for one channel,
+ *   - 'P' + 4 bytes: channel 2's phase and coupling.
  * See HAL_UART_RxCpltCallback. Every "letter" message ends with a check
  * byte, so adding another one later is easy.
  */
@@ -57,11 +58,13 @@ static uint16_t ch2[SAMPLES];             /* filled by DMA from ADC2 */
 static volatile int adcs_done;            /* +1 when an ADC's DMA finishes */
 static volatile uint8_t rate_index = 5;   /* start at 50 000 samples/s */
 static uint8_t rx_byte;                   /* last byte received from the PC */
-static uint8_t gen_command[10];           /* the 10 bytes after a 'G' */
-static uint8_t shape_command[GEN_POINTS + 1];   /* the 101 bytes after a 'W' */
-static volatile uint8_t receiving;        /* 'G' or 'W' while receiving its bytes, else 0 */
+static uint8_t gen_command[12];           /* the 12 bytes after a 'G' */
+static uint8_t shape_command[GEN_POINTS + 2];   /* the 102 bytes after a 'W' */
+static uint8_t phase_command[4];          /* the 4 bytes after a 'P' */
+static volatile uint8_t receiving;        /* 'G', 'W' or 'P' while receiving its bytes, else 0 */
 static volatile uint8_t gen_ready;        /* 1 = gen_command[] is complete */
 static volatile uint8_t shape_ready;      /* 1 = shape_command[] is complete */
+static volatile uint8_t phase_ready;      /* 1 = phase_command[] is complete */
 
 static uint32_t period_ticks, high_ticks; /* frequency counter results */
 static uint32_t last_edge_ms;             /* when it last saw a signal */
@@ -92,28 +95,39 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   adcs_done++;              /* the DMA has filled ch1 or ch2 */
 }
 
-/* Messages from the PC (numbers low byte first):
+/* Messages from the PC (numbers low byte first; ch = 0 for CH1, 1 for CH2):
  *   0..10  one byte: the sample rate
- *   'G'  wave (1 byte)  frequency Hz (4)  amplitude mV (2)  offset mV (2)  check
- *   'W'  100 shape points (1 byte each, 0 = bottom, 255 = top)  check
+ *   'G'  ch (1)  wave (1)  frequency Hz (4)  amplitude mV (2)  offset mV (2)
+ *        on (1)  check
+ *   'W'  ch (1)  100 shape points (1 byte each, 0 = bottom, 255 = top)  check
+ *   'P'  phase in degrees (2)  coupled (1)  check
  * check (1 byte) = the bytes between the letter and the check added up
  * (only the low 8 bits).
  * This runs in an interrupt, so it only stores the bytes. scope_run()
  * applies them later. Each letter has its own buffer, so a 'W' followed
- * at once by a 'G' (that is what the PC sends) does not overwrite it. */
+ * at once by a 'G' (that is what the PC sends) does not overwrite it.
+ * (Two messages with the SAME letter before scope_run() applies the first
+ * would overwrite it, so the PC sends at most one of each per packet.)
+ * Adding a new message: a new letter, a buffer, a flag, and 2 lines here. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (receiving == 'G') {
     gen_ready = 1;          /* all bytes after 'G' have arrived */
   } else if (receiving == 'W') {
     shape_ready = 1;        /* all bytes after 'W' have arrived */
+  } else if (receiving == 'P') {
+    phase_ready = 1;        /* all bytes after 'P' have arrived */
   } else if (rx_byte == 'G') {
-    receiving = 'G';        /* receive the next 10 bytes into gen_command[] */
+    receiving = 'G';        /* receive the next 12 bytes into gen_command[] */
     HAL_UART_Receive_IT(huart, gen_command, sizeof(gen_command));
     return;
   } else if (rx_byte == 'W') {
-    receiving = 'W';        /* receive the next 101 bytes into shape_command[] */
+    receiving = 'W';        /* receive the next 102 bytes into shape_command[] */
     HAL_UART_Receive_IT(huart, shape_command, sizeof(shape_command));
+    return;
+  } else if (rx_byte == 'P') {
+    receiving = 'P';        /* receive the next 4 bytes into phase_command[] */
+    HAL_UART_Receive_IT(huart, phase_command, sizeof(phase_command));
     return;
   } else if (rx_byte < RATE_COUNT) {
     rate_index = rx_byte;   /* the PC chose a new sample rate */
@@ -149,18 +163,25 @@ static int copy_and_check(uint8_t *copy, const uint8_t *received, int length)
  * ignored (the PC sends it again when it sees the board didn't change). */
 static void apply_commands(void)
 {
-  uint8_t c[GEN_POINTS + 1];
+  uint8_t c[GEN_POINTS + 2];
 
   if (shape_ready) {        /* first the shape: the 'G' after it may select it */
     shape_ready = 0;
     if (copy_and_check(c, shape_command, sizeof(shape_command))) {
-      generator_set_custom(c);
+      generator_set_custom(c[0], c + 1);
     }
   }
   if (gen_ready) {
     gen_ready = 0;
     if (copy_and_check(c, gen_command, sizeof(gen_command))) {
-      generator_set(c[0], get32(c + 1), get16(c + 5), get16(c + 7));
+      generator_set(c[0], c[1], get32(c + 2), get16(c + 6), get16(c + 8),
+                    c[10]);
+    }
+  }
+  if (phase_ready) {
+    phase_ready = 0;
+    if (copy_and_check(c, phase_command, sizeof(phase_command))) {
+      generator_set_phase(get16(c), c[2]);
     }
   }
 }
@@ -257,21 +278,40 @@ static void read_frequency_counter(void)
  *  14  4 bytes  frequency counter high time, in 170 MHz ticks
  *  18  1 byte   continuity: 1 = probe A3 touches GND
  *  19  1 byte   packet counter
- *  The generator on A2 (see generator.h):
- *  20  1 byte   wave: 0 sine, 1 square, 2 triangle, 3 sawtooth, 4 custom
- *  21  1 byte   table points (GEN_POINTS)
- *  22  4 bytes  frequency asked for, Hz
- *  26  2 bytes  TIM7 prescaler PSC
- *  28  2 bytes  TIM7 period ARR  (real frequency = 170 MHz/(PSC+1)/(ARR+1)/points)
- *  30  2 bytes  amplitude, mV peak to peak
- *  32  2 bytes  offset (middle level), mV
- *  34  1 byte   custom shape check (its 100 bytes added up, low 8 bits)
- *  35  SAMPLES x 2 bytes  channel 1 (A0), 0..4095
+ *  The generator (see generator.h):
+ *  20  1 byte   table points (GEN_POINTS)
+ *  21  2 bytes  channel 2 phase, degrees
+ *  23  1 byte   coupled: 1 = channel 2 runs on channel 1's timer
+ *  24  15 bytes generator channel 1 (A2), see put_channel() below
+ *  39  15 bytes generator channel 2 (D12)
+ *  54  SAMPLES x 2 bytes  channel 1 (A0), 0..4095
  *      SAMPLES x 2 bytes  channel 2 (A1), 0..4095
  *  end 2 bytes  checksum: sum of all bytes after the start marker
  */
 static void put16(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; }
 static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
+
+/* One generator channel, 15 bytes:
+ *   +0  wave: 0 sine, 1 square, 2 triangle, 3 sawtooth, 4 custom
+ *   +1  on: 1 = output on
+ *   +2  frequency asked for, Hz (4 bytes)
+ *   +6  timer prescaler PSC (2)
+ *   +8  timer period ARR (2)  (real frequency = 170 MHz/(PSC+1)/(ARR+1)/points)
+ *  +10  amplitude, mV peak to peak (2)
+ *  +12  offset (middle level), mV (2)
+ *  +14  custom shape check (its 100 bytes added up, low 8 bits) */
+static void put_channel(uint8_t *p, uint8_t ch)
+{
+  const GeneratorSettings *gen = generator_settings(ch);
+  p[0] = gen->wave;
+  p[1] = gen->on;
+  put32(p + 2, gen->freq_hz);
+  put16(p + 6, gen->prescaler);
+  put16(p + 8, gen->period);
+  put16(p + 10, gen->amplitude_mv);
+  put16(p + 12, gen->offset_mv);
+  p[14] = gen->custom_check;
+}
 
 static uint16_t sum_bytes(const void *data, int length)
 {
@@ -286,9 +326,8 @@ static uint16_t sum_bytes(const void *data, int length)
 static void send_packet(uint32_t rate, uint32_t vdda_mv, uint8_t continuity)
 {
   static uint8_t counter;
-  uint8_t header[35];
+  uint8_t header[54];
   uint8_t checksum[2];
-  const GeneratorSettings *gen = generator_settings();
 
   header[0] = 0xA5;
   header[1] = 0x5A;
@@ -299,14 +338,11 @@ static void send_packet(uint32_t rate, uint32_t vdda_mv, uint8_t continuity)
   put32(header + 14, high_ticks);
   header[18] = continuity;
   header[19] = counter++;
-  header[20] = gen->wave;
-  header[21] = GEN_POINTS;
-  put32(header + 22, gen->freq_hz);
-  put16(header + 26, gen->prescaler);
-  put16(header + 28, gen->period);
-  put16(header + 30, gen->amplitude_mv);
-  put16(header + 32, gen->offset_mv);
-  header[34] = gen->custom_check;
+  header[20] = GEN_POINTS;
+  put16(header + 21, generator_phase());
+  header[23] = generator_coupled();
+  put_channel(header + 24, 0);
+  put_channel(header + 39, 1);
 
   /* The STM32 stores uint16_t low byte first, so ch1/ch2 can be sent as is. */
   uint16_t sum = sum_bytes(header + 2, sizeof(header) - 2)
