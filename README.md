@@ -3,8 +3,9 @@
 A **function generator** is the opposite of an oscilloscope: it does not
 measure signals, it **makes** them. This project turns pin **A2** of a
 NUCLEO-G474RE into a small function generator. The PC chooses the wave
-(**sine, square, triangle, sawtooth**), the **frequency** (1 Hz to 10 kHz),
-the **amplitude** and the **offset** (DC level), all between 0 and 3.3 V.
+(**sine, square, triangle, sawtooth**, or a **custom** wave you draw with
+the mouse), the **frequency** (1 Hz to 10 kHz), the **amplitude** and the
+**offset** (DC level), all between 0 and 3.3 V.
 
 It is a copy of the SCOPE project, so the 2-channel **oscilloscope** and the
 **multimeter** are still there. With **one jumper wire from A2 to A0** you
@@ -36,7 +37,8 @@ picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
 ## What it can do
 
 **Function generator** (output A2)
-- Waves: **sine, square, triangle, sawtooth**.
+- Waves: **sine, square, triangle, sawtooth, custom** (one period you
+  draw with the mouse, see [Draw your own wave](#draw-your-own-wave-d)).
 - Frequency: **1 Hz to 10 000 Hz**, in steps of 1 Hz. The board makes the
   closest frequency its timer allows. The window shows that **real**
   frequency next to the one you asked for (see
@@ -48,8 +50,10 @@ picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
   (from 0.65 V to 2.65 V).
 
 **Oscilloscope** (A0 and A1) and **multimeter** (volts and Ω on A0,
-frequency on D3, continuity on A3): unchanged from SCOPE. 1 kS/s to 2 MS/s,
-trigger with Auto / Normal / Single.
+frequency on D3, continuity on A3): as in SCOPE. 1 kS/s to 2 MS/s,
+trigger with Auto / Normal / Single. New: **automatic measurements** for
+each channel (Vpp, min, max, average, RMS, frequency) and **cursors** you
+drag with the mouse.
 
 **Extra test signal: D12**, a 2 kHz square, 0 / 3.3 V, high 25 % of the time.
 
@@ -173,7 +177,8 @@ the COM port at a time.
 
 | Key | Does |
 |-----|------|
-| **G** | Next wave: sine → square → triangle → sawtooth → sine |
+| **G** | Next wave: sine → square → triangle → sawtooth → custom → sine |
+| **D** | Draw your own wave with the mouse (see below) |
 | **[** / **]** | Frequency down / up in 1-2-5 steps (1, 2, 5, 10, 20, 50, ... 10 000 Hz) |
 | **F** | Type a frequency in Hz, then **Enter** (1 to 10 000) |
 | **A** | Type the amplitude in volts peak to peak, then **Enter** (0 to 3.3) |
@@ -191,6 +196,69 @@ real = 170 MHz / (PSC+1) / (ARR+1) / points = 170 MHz / 1 / 3400 / 100
 A new setting is used at the start of the board's next capture. At slow
 time/div (50 ms/div) that can take up to a second.
 
+### Draw your own wave (D)
+
+![Drawing mode](docs/screenshot_draw.png)
+
+1. Press **D**. The scope picture is replaced by a drawing area that starts
+   with the current custom wave (at first: 4 stairs).
+2. Hold the **left mouse button** and draw **one period**, from left to
+   right. You can go over parts again. **C** starts from a flat line.
+3. Press **Enter**: the window turns your drawing into 100 points, sends
+   them to the board, and switches the generator to **custom**.
+   **Esc** cancels and keeps the old wave.
+
+**Amplitude and offset still work** on a drawn wave: the top of the
+drawing area is `offset + amplitude / 2`, the bottom is
+`offset − amplitude / 2` (the labels "top = ..." and "bottom = ..." show
+the values). So you can draw once and then make it bigger, smaller or
+higher with **A** and **O**, and faster with **[ ]** / **F**, just like the
+other waves. For the full 0 … 3.3 V use amplitude 3.3 and offset 1.65.
+
+![A drawn "heartbeat" at 200 Hz, with the cursors on](docs/screenshot_custom.png)
+
+*(Real screenshot of a drawn "heartbeat", 200 Hz, 3.0 Vpp. Cursors t1/t2
+measure one period: dt = 5 ms, 1/dt = 200 Hz. V1/V2 sit on the bottom and
+the top: dV = 2.78 V. Same temporary test build as the first screenshot.)*
+
+### Cursors and automatic measurements
+
+Under the scope, one line per channel is measured from the samples
+on screen:
+
+```
+CH1: Vpp 2.78  min 0.31  max 3.09  avg 1.169  rms 1.219 V  f 200 Hz (T 5 ms)
+```
+
+- **Vpp** = max − min. **avg** = the average (the DC level).
+- **rms** = √(average of v²). It **includes** the DC level, so a 2 Vpp sine
+  around 1.65 V gives about 1.80 V, not 0.71 V.
+- **f** counts how often the signal goes up through its middle. It needs at
+  least 2 periods on screen; otherwise it shows "-".
+
+Press **K** to show the **cursors**: two vertical lines **t1 / t2** and two
+horizontal lines **V1 / V2**. Drag any of them with the left mouse button.
+The box at the top left shows **dt** (time between t1 and t2), **1/dt**
+(the frequency, if dt is one period) and **dV** = V2 − V1.
+
+Press **K** again for **track** mode, like on a real scope: you drag only
+t1 / t2, and V1 / V2 jump by themselves to the wave's voltage at t1 and t2
+(a small ring marks each point). They follow the wave as it changes. Track
+uses the trigger channel; **T** switches between CH1 and CH2. The box shows
+"MANUAL" or "TRACK on CH1". A third **K** hides the cursors.
+
+**Max / min between the cursors:** while the cursors are on (manual or
+track), the window also searches the trigger channel **between t1 and t2**
+for its highest and lowest sample. A small ▼ marks the max and a ▲ the
+min. The box adds "max 2.650 V @ t +400 us" (time after the left-hand
+cursor), the same for min, and "max − min". Move t1 / t2 around one bump
+to measure just that bump.
+
+![Track mode with max/min markers on a 1 kHz triangle](docs/screenshot_track.png)
+
+*(Track mode on a test triangle, made without the board: V1 / V2 are the
+wave's voltage at t1 / t2, and ▼ / ▲ mark the max and min between them.)*
+
 **Scope and meter** (same as SCOPE)
 
 | Key | Does |
@@ -205,6 +273,7 @@ time/div (50 ms/div) that can take up to a second.
 | S | Arm a Single capture (again) |
 | C | Clear the screen |
 | 1 / 2 | Show / hide CH1 / CH2 |
+| **K** | Cursors: off → manual (drag all 4 lines) → track (V1/V2 follow the wave) → off |
 | Space | Pause |
 | F12 | Save `screenshot.png` |
 | Esc | Quit |
@@ -257,6 +326,12 @@ measures it at start-up and scales the table to it.
 - When you change a setting, the wave stops for a moment and restarts at
   the beginning of the table.
 - Frequency accuracy: the formula is exact; the chip's clock is ±1 %.
+- A drawn wave has 100 points with 256 levels each (0 … 255). Sharp jumps
+  in a drawing are fine, but a fast mouse can't draw finer detail than
+  1/100 of a period.
+- The board forgets a drawn wave when it is reset (it starts with the
+  4 stairs). The window notices and sends its drawing again when you
+  choose "custom".
 
 ## Files
 
@@ -264,16 +339,17 @@ measures it at start-up and scales the table to it.
 FUNCGEN/
 ├── README.md                     this file
 ├── HOW_IT_WORKS.md               the code, explained step by step
-├── docs/screenshot.png           triangle on the scope (screenshot_sawtooth.png: sawtooth)
+├── docs/screenshot.png           triangle on the scope (screenshot_sawtooth.png: sawtooth,
+│                                 screenshot_draw.png / screenshot_custom.png: a drawn wave)
 ├── pc_app/
-│   ├── funcgen_window.py         the PC window (pygame): scope, meter, generator panel
+│   ├── funcgen_window.py         the PC window (pygame): scope, meter, cursors, generator panel, drawing
 │   └── requirements.txt
 └── FuncGen/                      STM32CubeIDE project
     ├── FuncGen.ioc               CubeMX settings (pins, ADCs, DAC, timers, DMA, UART)
     └── Core/
         ├── Src/main.c            generated; our lines are in USER CODE
-        ├── Src/generator.c       NEW: table -> DMA -> DAC, timer maths
+        ├── Src/generator.c       NEW: table -> DMA -> DAC, timer maths, custom wave
         ├── Inc/generator.h       NEW: wave names and limits
-        ├── Src/scope.c           capture + measure + send; receives generator commands
+        ├── Src/scope.c           capture + measure + send; receives 'G' and 'W' commands
         └── Inc/scope.h
 ```

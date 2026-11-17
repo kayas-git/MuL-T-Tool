@@ -87,6 +87,15 @@ period (0 = start, 0.99 = end):
 | square | `+1` for the first half, `−1` for the second | jumps |
 | triangle | `−1 + 4x` (up), then `3 − 4x` (down) | straight lines |
 | sawtooth | from −1 to +1 across the 100 points, then drop | ramp |
+| custom | `custom[i] / 127.5 − 1` (the drawn byte 0 … 255 → −1 … +1) | anything |
+
+The **custom** wave is the one you draw on the PC. `generator_set_custom()`
+stores its 100 bytes in `custom[]`, adds them up into `custom_check` (sent
+back to the PC, so it can see that the board really has its drawing), and
+refills the table if the custom wave is playing. Because it goes through
+the same −1 … +1 → `fill_table()` path, amplitude and offset work on it like
+on every other wave. That was the simplest choice: no special case. At
+start-up, `generator_start()` puts in a "stairs" shape (0, 85, 170, 255).
 
 ### b) The lookup table: `fill_table()`
 
@@ -161,53 +170,71 @@ HAL_TIM_Base_Start(&htim7);
 Stopping first means the DMA never sends a half-new table. The wave pauses
 for a few microseconds, then restarts at the beginning. First,
 `generator_set()` limits every number to its range (1..10 000 Hz,
-0..3300 mV, wave 0..3), so a bad command can't do anything strange.
+0..3300 mV, wave 0..4), so a bad command can't do anything strange.
 
 `generator_settings()` lets `scope.c` read the current settings, to send
 them to the PC.
 
 ## 4. `scope.c`: commands in, measurements out
 
-### a) Receiving a generator command
+### a) Receiving commands
 
-The PC sends two kinds of messages over the same USB serial link:
+The PC sends three kinds of messages over the same USB serial link:
 
 | Message | Bytes | Meaning |
 |---------|-------|---------|
 | rate | 1 byte, 0 … 10 | choose the sample rate (as in SCOPE) |
 | generator | `'G'`, wave (1), frequency Hz (4), amplitude mV (2), offset mV (2), check (1) | 11 bytes |
+| shape | `'W'`, 100 points (0 = bottom … 255 = top), check (1) | 102 bytes |
 
-The numbers are sent "low byte first". The check byte is the sum of the 9
-bytes after `'G'`, keeping only the low 8 bits. `'G'` is 71, so it can never
-be confused with a rate byte (0 … 10).
+The numbers are sent "low byte first". The check byte is the sum of the
+bytes after the letter, keeping only the low 8 bits. `'G'` is 71 and `'W'`
+is 87, so neither can be confused with a rate byte (0 … 10).
 
-`HAL_UART_RxCpltCallback()` runs (in an interrupt) after each receive:
+`HAL_UART_RxCpltCallback()` runs (in an interrupt) after each receive.
+`receiving` remembers which message we are in the middle of:
 
 ```c
-if (receiving_command) {        /* the 10 bytes after 'G' arrived */
-    receiving_command = 0;
-    command_ready = 1;
-} else if (rx_byte == 'G') {    /* a command starts: get 10 more bytes */
-    receiving_command = 1;
-    HAL_UART_Receive_IT(huart, command, sizeof(command));
+if (receiving == 'G') {          /* the 10 bytes after 'G' arrived */
+    gen_ready = 1;
+} else if (receiving == 'W') {   /* the 101 bytes after 'W' arrived */
+    shape_ready = 1;
+} else if (rx_byte == 'G') {     /* a command starts: get 10 more bytes */
+    receiving = 'G';
+    HAL_UART_Receive_IT(huart, gen_command, sizeof(gen_command));
+    return;
+} else if (rx_byte == 'W') {     /* a shape starts: get 101 more bytes */
+    receiving = 'W';
+    HAL_UART_Receive_IT(huart, shape_command, sizeof(shape_command));
     return;
 } else if (rx_byte < RATE_COUNT) {
-    rate_index = rx_byte;       /* a rate byte, as before */
+    rate_index = rx_byte;        /* a rate byte, as before */
 }
+receiving = 0;
 HAL_UART_Receive_IT(huart, &rx_byte, 1);
 ```
 
-Interrupt code should be short, so it only sets `command_ready`. Then
-`scope_run()` calls `apply_command()` at its start. That function copies the
-bytes, checks the check byte (a damaged command is ignored), and calls
-`generator_set()`. If a byte is lost (an error), `HAL_UART_ErrorCallback()`
-forgets the half command and listens for single bytes again.
+Each letter has **its own buffer**. To play a drawing, the PC sends `'W'`
+and then at once `'G'` (wave = custom); with one shared buffer, the `'G'`
+could overwrite the shape before it was used.
+
+Interrupt code should be short, so it only sets the `..._ready` flags.
+`scope_run()` calls `apply_commands()` at its start. `copy_and_check()`
+copies the bytes and checks the check byte (a damaged message is ignored).
+The shape is applied first, then the `'G'`, which may select it. If a byte
+is lost (an error), `HAL_UART_ErrorCallback()` forgets the half message and
+listens for single bytes again.
+
+**Adding a new message later** (for example for a logic analyzer mode):
+choose a new letter, give it a buffer and a `..._ready` flag, add one
+`else if` in the callback and one `if` in `apply_commands()`.
 
 ### b) Send: `send_packet()`
 
-One packet = 34-byte header + 1000 CH1 samples + 1000 CH2 samples + checksum
-(4036 bytes). Bytes 20 … 33 are new: the generator's wave, table points,
-asked frequency, PSC, ARR, amplitude and offset. The PC uses them to show
+One packet = 35-byte header + 1000 CH1 samples + 1000 CH2 samples + checksum
+(4037 bytes). Bytes 20 … 34 are new: the generator's wave, table points,
+asked frequency, PSC, ARR, amplitude, offset and (byte 34) the custom
+shape's check sum. The PC uses them to show
 what the board is **really** doing, not just what it asked for. The table
 at the top of `send_packet()` lists every byte. The **start marker** `A5 5A`
 lets the PC find the start; the **checksum** lets it throw away a damaged
@@ -253,6 +280,54 @@ packet. At 4 250 000 baud a packet takes about 9.5 ms.
   them, so they compare equal.
 - `draw_generator()` draws the three green lines under the scope, and
   "CLIPPED" when `offset ± amplitude/2` goes outside 0 … VDDA.
+
+### Drawing a wave (D)
+
+- **D** copies the current custom shape into `self.drawing` (100 numbers,
+  0 … 255), and `draw_canvas()` shows it instead of the scope.
+- `mouse()` passes every mouse position (button held) to `draw_at(x, y)`.
+  The x position becomes a point number 0 … 99, the y position a value
+  0 … 255 (bottom … top of the grid). The mouse only reports where it is a
+  few hundred times a second, so a fast mouse skips points. `draw_at()`
+  fills them in with a straight line from the last position. That is how a
+  mouse path of any length becomes **exactly 100 points** (resampling).
+- **Enter** (`draw_key()`): `shape_command()` builds `'W'` + 100 bytes +
+  check, then the usual `'G'` with wave = custom is sent right after.
+- **Lost shape?** `check_generator()` compares the board's shape check
+  (header byte 34) with the sum of our drawing, and sends `'W'` again if
+  they differ. Rate bytes are re-sent too, if packets arrive at the wrong
+  rate for over a second (a lost `'W'` could leave stray bytes behind).
+
+### Automatic measurements and cursors (K)
+
+- `measurements(signal, rate)` works on the 500 samples on screen:
+  min, max, Vpp = max − min, avg = sum / count,
+  rms = √(sum of v² / count), and `signal_frequency()` for f
+  (count upward crossings of the middle, with a little hysteresis so noise
+  doesn't count twice; f = rate × (crossings − 1) / samples between the
+  first and last).
+- The time cursors are stored as **sample positions** (0 … 500), the
+  voltage cursors as **volts**. So they stay on the signal when you change
+  time/div or volts/div. dt = (t2 − t1) / sample rate. Example: 250 samples
+  at 50 kS/s = 5 ms, 1/dt = 200 Hz.
+- `mouse()`: on a click, the cursor line nearest to the mouse (within
+  10 pixels) is grabbed; while the button is held it follows the mouse.
+  `y_of()` turns volts into a pixel row; the drag does the opposite.
+- **Track mode**: `self.cursor_mode` is `"off"`, `"manual"` or `"track"`
+  (K goes to the next one). In track mode `draw_cursors()` sets, **every
+  frame**, `V1 = signal[t1]` and `V2 = signal[t2]`, where `signal` is the
+  trigger channel's 500 samples on screen (`t` is rounded to a whole sample).
+  So V1 / V2 are simply "the sample under the time cursor". `mouse()` then
+  only lets you grab t1 / t2. Switching back to manual keeps the last
+  tracked voltages, so you can fine-tune them by hand.
+- **Max / min between the cursors** (`gated_peaks()`): "gated" means it
+  only looks at part of the signal, the samples from the left-hand cursor
+  to the right-hand one (`sorted(...)`, so t1 and t2 may be in any order).
+  `max(part, key=...)` gives the **index** of the highest sample, so we know
+  both its voltage and its time: `(index − first) / sample rate`. If
+  t1 = t2 the part is one sample; on a cleared screen it returns `None` and
+  nothing is drawn. The ▼ / ▲ markers are drawn after the box, so the box
+  can't hide them.
 
 ### The scope and meter (unchanged from SCOPE)
 

@@ -7,7 +7,9 @@
  *                TIM7: every time it overflows, the DMA copies the NEXT
  *                table value into the DAC, which outputs that voltage.
  *
- * The table holds ONE period of the wave (GEN_POINTS = 100 values). The DMA
+ * The table holds ONE period of the wave (GEN_POINTS = 100 values). The
+ * shape comes from a formula (sine, square, triangle, sawtooth) or, for the
+ * "custom" wave, from 100 numbers the user drew on the PC. The DMA
  * is "circular": after the last value it starts again at the first one. So
  *
  *   frequency = 170 MHz / (PSC + 1) / (ARR + 1) / 100
@@ -39,6 +41,7 @@ extern TIM_HandleTypeDef htim7;
 #define TIMER_CLOCK 170000000UL   /* TIM7 counts at the full 170 MHz */
 
 static uint16_t table[GEN_POINTS];   /* one period, DAC values 0..4095 */
+static uint8_t custom[GEN_POINTS];   /* the drawn shape, 0 (bottom)..255 (top) */
 static GeneratorSettings settings;
 static uint32_t full_scale_mv = 3300; /* the DAC outputs this at value 4095 */
 
@@ -53,6 +56,8 @@ static float shape(uint8_t wave, int i)
       return (x < 0.5f) ? -1.0f + 4.0f * x : 3.0f - 4.0f * x;
     case WAVE_SAWTOOTH:                 /* slowly up, then drop at once */
       return -1.0f + 2.0f * (float)i / (GEN_POINTS - 1);
+    case WAVE_CUSTOM:                   /* drawn on the PC: 0..255 -> -1..+1 */
+      return custom[i] / 127.5f - 1.0f;
     default:                            /* WAVE_SINE */
       return sinf(2.0f * 3.14159265f * x);
   }
@@ -103,7 +108,7 @@ static uint32_t limit(uint32_t value, uint32_t low, uint32_t high)
 void generator_set(uint8_t wave, uint32_t freq_hz,
                    uint32_t amplitude_mv, uint32_t offset_mv)
 {
-  settings.wave = wave <= WAVE_SAWTOOTH ? wave : WAVE_SINE;
+  settings.wave = wave <= WAVE_CUSTOM ? wave : WAVE_SINE;
   settings.freq_hz = limit(freq_hz, GEN_MIN_HZ, GEN_MAX_HZ);
   settings.amplitude_mv = limit(amplitude_mv, 0, GEN_MAX_MV);
   settings.offset_mv = limit(offset_mv, 0, GEN_MAX_MV);
@@ -126,9 +131,30 @@ void generator_set(uint8_t wave, uint32_t freq_hz,
   HAL_TIM_Base_Start(&htim7);
 }
 
+void generator_set_custom(const uint8_t *points)
+{
+  uint8_t check = 0;
+  for (int i = 0; i < GEN_POINTS; i++) {
+    custom[i] = points[i];
+    check += points[i];
+  }
+  settings.custom_check = check;
+  if (settings.wave == WAVE_CUSTOM) {   /* playing it now: new table */
+    generator_set(settings.wave, settings.freq_hz,
+                  settings.amplitude_mv, settings.offset_mv);
+  }
+}
+
 void generator_start(uint32_t vdda_mv)
 {
   full_scale_mv = vdda_mv;
+  /* Until the user draws one, the custom wave is 4 steps, like stairs:
+   * 0, 85, 170, 255 (25 points each). */
+  uint8_t stairs[GEN_POINTS];
+  for (int i = 0; i < GEN_POINTS; i++) {
+    stairs[i] = (i / 25) * 85;
+  }
+  generator_set_custom(stairs);
   /* 1 kHz sine, 2 V peak to peak, around 1.65 V: from 0.65 V to 2.65 V. */
   generator_set(WAVE_SINE, 1000, 2000, 1650);
 }

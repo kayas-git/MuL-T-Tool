@@ -8,8 +8,12 @@ per second). This script only:
      the generator's settings),
   3. draws them: an oscilloscope screen, or big multimeter numbers, and
      the generator's settings with its real frequency,
-  4. sends the chosen sample rate (one byte) and generator settings
-     ('G' + 10 bytes) to the board.
+  4. sends the chosen sample rate (one byte), generator settings
+     ('G' + 10 bytes) and a drawn wave shape ('W' + 101 bytes) to the board.
+
+Extras: K shows two time + two voltage cursors (drag them with the mouse);
+press K again for "track" mode, where the voltage cursors follow the wave.
+D lets you draw one period of a "custom" wave with the mouse.
 
 INPUTS: 0 V to 3.3 V ONLY. Never connect mains, car or other batteries,
 or anything negative. That can destroy the board and your PC's USB port.
@@ -30,14 +34,19 @@ from serial.tools import list_ports
 
 BAUD = 4250000                # must match USART2 in the board's FuncGen.ioc
 START = b"\xA5\x5A"           # every packet starts with these 2 bytes
-HEADER = 34                   # bytes before the samples (see scope.c)
+HEADER = 35                   # bytes before the samples (see scope.c)
 TIMER_HZ = 170_000_000        # TIM2 (frequency counter) and TIM7 count this fast
 
 # The generator (generator.h). The PC uses the same limits as the board.
-WAVES = ["sine", "square", "triangle", "sawtooth"]
+WAVES = ["sine", "square", "triangle", "sawtooth", "custom"]
+CUSTOM = 4                    # the wave number of the drawn ("custom") wave
+POINTS = 100                  # table points per period (GEN_POINTS)
+# The board's custom shape until you draw one: 4 stairs (generator.c).
+STAIRS = [(i // 25) * 85 for i in range(POINTS)]
 GEN_MIN_HZ, GEN_MAX_HZ, GEN_MAX_V = 1, 10000, 3.3
 GEN_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
 GEN_COLOR = (120, 255, 140)
+CURSOR_COLOR = (230, 120, 255)
 
 # The board's sample rates (RATES[] in scope.c). We send the index.
 RATES = [1000, 2500, 5000, 10000, 25000, 50000,
@@ -87,8 +96,8 @@ def read_packets(buffer):
             del buffer[:start]
             return packets                  # wait for the rest
         rate, n, vdda_mv, period, high, continuity, counter, \
-            wave, points, freq, psc, arr, amp_mv, offset_mv = \
-            struct.unpack_from("<IHHIIBBBBIHHHH", buffer, start + 2)
+            wave, points, freq, psc, arr, amp_mv, offset_mv, shape = \
+            struct.unpack_from("<IHHIIBBBBIHHHHB", buffer, start + 2)
         size = HEADER + 4 * n + 2
         if n > 5000:                        # nonsense: not a real packet
             del buffer[:start + 1]
@@ -114,7 +123,7 @@ def read_packets(buffer):
             "counter": counter,             # +1 for every packet the board sends
             "gen": {"wave": wave, "freq": freq, "amp": amp_mv / 1000,
                     "offset": offset_mv / 1000, "psc": psc, "arr": arr,
-                    "points": points},
+                    "points": points, "shape": shape},
         })
         del buffer[:start + size]
 
@@ -216,6 +225,37 @@ def generator_command(wave, freq, amp, offset):
     return b"G" + body + bytes([sum(body) & 0xFF])
 
 
+def shape_command(shape):
+    """The 102 bytes that send a drawn wave (see scope.c): 'W', the 100
+    shape points (0 = bottom .. 255 = top), check = the 100 added up."""
+    return b"W" + bytes(shape) + bytes([sum(shape) & 0xFF])
+
+
+def measurements(signal, rate):
+    """Automatic measurements of the samples on screen, like a real scope:
+    min, max, peak-to-peak, average, RMS and frequency."""
+    low, high = min(signal), max(signal)
+    return {"min": low, "max": high, "vpp": high - low,
+            "avg": sum(signal) / len(signal),
+            # RMS = root of the mean of the squares. It includes the DC part:
+            # for a sine around 1.65 V it is NOT amplitude / 2.83.
+            "rms": math.sqrt(sum(v * v for v in signal) / len(signal)),
+            "freq": signal_frequency(signal, rate)}
+
+
+def gated_peaks(signal, t1, t2):
+    """Peak search between the two time cursors ("gated": only that part).
+    Returns (first, index of the highest sample, index of the lowest), or
+    None if there are no samples (screen cleared with C)."""
+    if not signal:
+        return None
+    last = len(signal) - 1
+    first, end = sorted(min(round(t), last) for t in (t1, t2))   # either order
+    part = range(first, end + 1)        # t1 == t2: just that one sample
+    return (first, max(part, key=lambda i: signal[i]),
+            min(part, key=lambda i: signal[i]))
+
+
 def make_beep():
     """A 1 kHz tone to loop while the continuity probe touches GND."""
     pygame.mixer.init(44100, -16, 1)
@@ -254,34 +294,60 @@ class Window:
         self.gen = None
         self.gen_sent_ms = 0                # when we last sent them
         self.entry = None                   # typing a number: ("F", "440")
+        # The custom wave's shape (100 numbers, 0..255), and the shape being
+        # drawn (a list of 100 numbers while in drawing mode, else None).
+        self.custom = list(STAIRS)
+        self.drawing = None
+        self.last_drawn = None              # last point the mouse drew
+        # Cursors (K): 2 time cursors, as a sample position on the screen
+        # (0 .. SHOWN), and 2 voltage cursors, in volts.
+        # K cycles the mode: "off" -> "manual" (drag all 4 lines) ->
+        # "track" (drag t1/t2; V1/V2 = the trigger channel's voltage there).
+        self.cursor_mode = "off"
+        self.cursor_t = [100.0, 300.0]
+        self.cursor_v = [0.5, 2.5]
+        self.dragging = None                # ("t" or "v", 0 or 1) while dragging
+        self.rate_sent_ms = 0
         self.send_rate()
 
     # ---- talking to the board ----
     def send_rate(self):
         index = METER_RATE if self.meter_mode else self.rate_index
         self.link.write(bytes([index]))
+        self.rate_sent_ms = pygame.time.get_ticks()
 
-    def send_generator(self):
+    def send_generator(self, with_shape=False):
+        """Send the settings ('G'). with_shape: first send our custom shape
+        ('W'), so a following 'G' with the custom wave plays it."""
         g = self.gen
+        if with_shape:
+            self.link.write(shape_command(self.custom))
+            g["shape"] = sum(self.custom) & 0xFF
         self.link.write(generator_command(g["wave"], g["freq"], g["amp"], g["offset"]))
         self.gen_sent_ms = pygame.time.get_ticks()
 
     def check_generator(self, packet):
         """Take over the board's settings at the start. Later, if the board
         does not show ours (a lost command, or the board was reset), send
-        them again, at most once a second."""
+        them again, at most once a second. The shape only matters while the
+        custom wave plays."""
         board = packet["gen"]
         if self.gen is None:
-            self.gen = {k: board[k] for k in ("wave", "freq", "amp", "offset")}
-        elif any(abs(self.gen[k] - board[k]) > 0.0005 for k in self.gen) \
-                and pygame.time.get_ticks() - self.gen_sent_ms > 1000:
-            self.send_generator()
+            self.gen = {k: board[k] for k in ("wave", "freq", "amp", "offset", "shape")}
+            return
+        keys = ["wave", "freq", "amp", "offset"]
+        if self.gen["wave"] == CUSTOM:
+            keys.append("shape")
+        wrong = [k for k in keys if abs(self.gen[k] - board[k]) > 0.0005]
+        if wrong and pygame.time.get_ticks() - self.gen_sent_ms > 1000:
+            self.send_generator(with_shape="shape" in wrong)
 
     def change_generator(self, **changes):
         if self.gen is None:
             return                          # no packet yet: we don't know it
         self.gen.update(changes)
-        self.send_generator()
+        # With the custom wave, send its shape too (102 more bytes: cheap).
+        self.send_generator(with_shape=self.gen["wave"] == CUSTOM)
 
     # ---- typing a number (F, A, O) ----
     ENTRY_TEXT = {"F": f"frequency in Hz ({GEN_MIN_HZ} .. {GEN_MAX_HZ})",
@@ -310,13 +376,88 @@ class Window:
         elif event.unicode and event.unicode in "0123456789." and len(text) < 8:
             self.entry = (what, text + event.unicode)
 
+    # ---- drawing a custom wave (D) ----
+    def draw_key(self, event):
+        """Keys while drawing: Enter = send it, Esc = cancel, C = flat."""
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.custom = [round(v) for v in self.drawing]
+            self.drawing = None
+            if self.gen is not None:        # play it: 'W' (shape) + 'G' (custom)
+                self.gen["wave"] = CUSTOM
+                self.send_generator(with_shape=True)
+        elif event.key == pygame.K_ESCAPE:
+            self.drawing = None             # cancel: keep the old shape
+        elif event.key == pygame.K_c:
+            self.drawing = [127.5] * POINTS  # a flat line in the middle
+
+    def draw_at(self, x, y):
+        """The mouse is at (x, y) with the button down: set the shape there.
+        Between the last point and this one we draw a straight line, so a
+        fast mouse leaves no gaps. (This turns the mouse path into exactly
+        100 points: the "resampling".)"""
+        i = round((x - GX) / GW * (POINTS - 1))
+        i = min(max(i, 0), POINTS - 1)
+        value = (GY + GH - y) / GH * 255     # bottom of the grid 0, top 255
+        value = min(max(value, 0.0), 255.0)
+        j, old = self.last_drawn if self.last_drawn else (i, value)
+        steps = abs(i - j)
+        for s in range(steps + 1):
+            k = j + (s if i > j else -s)
+            t = s / steps if steps else 1.0
+            self.drawing[k] = old + (value - old) * t
+        self.last_drawn = (i, value)
+
+    # ---- the mouse: drawing, or dragging a cursor ----
+    def y_of(self, volts):                  # 0 V is the bottom line
+        return GY + GH - volts / VOLTS_PER_DIV[self.vdiv_index] * DIV_Y
+
+    def mouse(self, event):
+        if event.type == pygame.MOUSEBUTTONUP:
+            self.dragging = self.last_drawn = None
+            return
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button != 1:
+            return                          # left button only
+        if event.type == pygame.MOUSEMOTION and not event.buttons[0]:
+            return                          # moving without the button
+        x, y = event.pos
+        if self.drawing is not None:
+            self.draw_at(x, y)
+            return
+        if self.cursor_mode == "off" or self.meter_mode:
+            return
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            # Grab the cursor line nearest to the mouse (within 10 pixels).
+            near = [(abs(x - (GX + t * GW / SHOWN)), ("t", n))
+                    for n, t in enumerate(self.cursor_t)]
+            if self.cursor_mode == "manual":    # in track mode V1/V2 move by themselves
+                near += [(abs(y - self.y_of(v)), ("v", n))
+                         for n, v in enumerate(self.cursor_v)]
+            distance, which = min(near)
+            self.dragging = which if distance <= 10 else None
+        if self.dragging:
+            kind, n = self.dragging
+            if kind == "t":                 # pixels -> sample position
+                self.cursor_t[n] = min(max((x - GX) * SHOWN / GW, 0), SHOWN)
+            else:                           # pixels -> volts
+                top = VOLTS_PER_DIV[self.vdiv_index] * DIVS_Y
+                volts = (GY + GH - y) / DIV_Y * VOLTS_PER_DIV[self.vdiv_index]
+                self.cursor_v[n] = min(max(volts, 0.0), top)
+
     # ---- keyboard ----
     def key(self, event):
         if self.entry is not None:          # typing a number: keys go there
             self.entry_key(event)
             return
+        if self.drawing is not None:        # drawing: keys go there
+            self.draw_key(event)
+            return
         k = event.key
-        if k == pygame.K_g and self.gen:    # next wave shape
+        if k == pygame.K_d:                 # draw a wave, starting from the last one
+            self.drawing = [float(v) for v in self.custom]
+        elif k == pygame.K_k:               # cursors: off -> manual -> track -> off
+            modes = ["off", "manual", "track"]
+            self.cursor_mode = modes[(modes.index(self.cursor_mode) + 1) % 3]
+        elif k == pygame.K_g and self.gen:  # next wave shape
             self.change_generator(wave=(self.gen["wave"] + 1) % len(WAVES))
         elif k == pygame.K_RIGHTBRACKET and self.gen:   # next step up
             higher = [f for f in GEN_STEPS if f > self.gen["freq"]]
@@ -414,9 +555,7 @@ class Window:
             self.text("Waiting for the board...", GX + 300, GY + GH // 2)
             return
         vdiv = VOLTS_PER_DIV[self.vdiv_index]
-
-        def y_of(volts):                    # 0 V is the bottom line
-            return GY + GH - volts / vdiv * DIV_Y
+        y_of = self.y_of
 
         color = CH_COLORS[self.trigger_source]
         level_y = y_of(self.trigger_level)
@@ -432,6 +571,8 @@ class Window:
                 points = [(GX + i * GW / SHOWN, y_of(v)) for i, v in enumerate(view["ch"][ch])]
                 pygame.draw.lines(self.screen, CH_COLORS[ch], False, points, 2)
         self.screen.set_clip(None)
+        if self.cursor_mode != "off":
+            self.draw_cursors(view)
 
         time_div = SHOWN / DIVS_X / view["rate"]
         y = GY + GH + 10
@@ -442,15 +583,95 @@ class Window:
                   f"{'  PAUSED' if self.paused else ''}", GX, y)
         for ch in (0, 1):
             signal = view["ch"][ch]         # numbers for what is on screen
+            y_text = y + 22 + 20 * ch
             if not signal:                  # cleared with C
-                self.text(f"CH{ch + 1}: min -  max -  avg -  freq -",
-                          GX, y + 22 + 20 * ch, CH_COLORS[ch])
+                self.text(f"CH{ch + 1}: -", GX, y_text, CH_COLORS[ch])
                 continue
-            freq = signal_frequency(signal, view["rate"])
-            self.text(f"CH{ch + 1}: min {min(signal):.2f} V  max {max(signal):.2f} V  "
-                      f"avg {sum(signal) / len(signal):.3f} V  "
-                      f"freq {nice(freq, 'Hz') if freq else '-'}",
-                      GX, y + 22 + 20 * ch, CH_COLORS[ch])
+            m = measurements(signal, view["rate"])
+            freq = (f"{nice(m['freq'], 'Hz')} (T {nice(1 / m['freq'], 's')})"
+                    if m["freq"] else "-")
+            self.text(f"CH{ch + 1}: Vpp {m['vpp']:.2f}  min {m['min']:.2f}  "
+                      f"max {m['max']:.2f}  avg {m['avg']:.3f}  rms {m['rms']:.3f} V  "
+                      f"f {freq}", GX, y_text, CH_COLORS[ch])
+
+    def draw_cursors(self, view):
+        """Two time cursors (vertical) and two voltage cursors (horizontal),
+        with what they measure in a box at the top left of the screen."""
+        track = self.cursor_mode == "track"
+        signal = view["ch"][self.trigger_source]
+        if track and signal:
+            # Track: V1/V2 = the sample under t1/t2 on the trigger channel.
+            # Done every frame, so they follow the wave as it changes.
+            self.cursor_v = [signal[min(round(t), len(signal) - 1)] for t in self.cursor_t]
+        xs = [GX + t * GW / SHOWN for t in self.cursor_t]
+        ys = [self.y_of(v) for v in self.cursor_v]
+        for n in (0, 1):
+            pygame.draw.line(self.screen, CURSOR_COLOR, (xs[n], GY), (xs[n], GY + GH))
+            pygame.draw.line(self.screen, CURSOR_COLOR, (GX, ys[n]), (GX + GW, ys[n]))
+            self.text(f"t{n + 1}", xs[n] + 3, GY + GH - 18, CURSOR_COLOR)
+            self.text(f"V{n + 1}", GX + GW - 26, ys[n] - 18, CURSOR_COLOR)
+            if track and signal:            # a ring where the cursor meets the wave
+                pygame.draw.circle(self.screen, CURSOR_COLOR, (xs[n], ys[n]), 6, 2)
+        dt = abs(self.cursor_t[1] - self.cursor_t[0]) / view["rate"]  # samples -> seconds
+        dv = self.cursor_v[1] - self.cursor_v[0]
+        mode = (f"TRACK on CH{self.trigger_source + 1} (T changes)" if track
+                else "MANUAL (K = track)")
+        lines = [mode,
+                 f"dt = {nice(dt, 's')}   1/dt = {nice(1 / dt, 'Hz') if dt else '-'}",
+                 f"V1 = {self.cursor_v[0]:.3f} V   V2 = {self.cursor_v[1]:.3f} V",
+                 f"dV = V2 - V1 = {dv:+.3f} V"]
+        peaks = gated_peaks(signal, *self.cursor_t)
+        if peaks:
+            # Peak search between t1 and t2. Times are counted from the
+            # left-hand cursor.
+            first, i_max, i_min = peaks
+            for name, i in (("max", i_max), ("min", i_min)):
+                after = (i - first) / view["rate"]
+                lines.append(f"{name} {signal[i]:.3f} V @ t +{nice(after, 's')}")
+            lines.append(f"max - min = {signal[i_max] - signal[i_min]:.3f} V")
+        height = 4 + 20 * len(lines)
+        pygame.draw.rect(self.screen, BLACK, (GX + 4, GY + 14, 330, height))
+        pygame.draw.rect(self.screen, CURSOR_COLOR, (GX + 4, GY + 14, 330, height), 1)
+        for i, line in enumerate(lines):
+            self.text(line, GX + 10, GY + 18 + 20 * i, CURSOR_COLOR)
+        if peaks:
+            # Drawn last, so the box can't hide them: a triangle above the
+            # highest sample (tip down) and one below the lowest (tip up).
+            for i, tip, base in ((i_max, -4, -14), (i_min, 4, 14)):
+                x, y = GX + i * GW / SHOWN, self.y_of(signal[i])
+                pygame.draw.polygon(self.screen, CURSOR_COLOR,
+                                    [(x, y + tip), (x - 6, y + base), (x + 6, y + base)])
+        for i, line in enumerate(lines):
+            self.text(line, GX + 10, GY + 18 + 20 * i, CURSOR_COLOR)
+        if peaks:
+            # Drawn last, so the box can't hide them: a triangle above the
+            # highest sample (tip down) and one below the lowest (tip up).
+            for i, tip, base in ((i_max, -4, -14), (i_min, 4, 14)):
+                x, y = GX + i * GW / SHOWN, self.y_of(signal[i])
+                pygame.draw.polygon(self.screen, CURSOR_COLOR,
+                                    [(x, y + tip), (x - 6, y + base), (x + 6, y + base)])
+
+    def draw_canvas(self):
+        """Drawing mode (D): the screen is one period of the custom wave.
+        Left = start, right = end, top = offset + amplitude/2, bottom =
+        offset - amplitude/2."""
+        for i in range(DIVS_X + 1):
+            pygame.draw.line(self.screen, GRID, (GX + i * DIV_X, GY), (GX + i * DIV_X, GY + GH))
+        for i in range(DIVS_Y + 1):
+            pygame.draw.line(self.screen, GRID, (GX, GY + i * DIV_Y), (GX + GW, GY + i * DIV_Y))
+        points = [(GX + i * GW / (POINTS - 1), GY + GH - v / 255 * GH)
+                  for i, v in enumerate(self.drawing)]
+        pygame.draw.lines(self.screen, GEN_COLOR, False, points, 3)
+        g = self.gen
+        top = f"{g['offset'] + g['amp'] / 2:.2f} V" if g else "top"
+        bottom = f"{g['offset'] - g['amp'] / 2:.2f} V" if g else "bottom"
+        self.text(f"top = {top}", GX + 6, GY + 4, GEN_COLOR)
+        self.text(f"bottom = {bottom}", GX + 6, GY + GH - 20, GEN_COLOR)
+        y = GY + GH + 10
+        self.text("DRAWING one period of the custom wave (100 points):", GX, y, GEN_COLOR)
+        self.text("hold the left mouse button and draw from left to right.", GX, y + 22, GEN_COLOR)
+        self.text("Enter = send it to the board   C = flat line   Esc = cancel",
+                  GX, y + 42, (255, 255, 0))
 
     def draw_meter(self, p):
         if p is None:
@@ -507,11 +728,12 @@ class Window:
                   "PgUp/PgDn   trigger level", "E           trigger edge",
                   "T           trigger CH1/CH2", "Tab         trigger mode",
                   "S           arm Single", "C           clear screen",
-                  "1 / 2       show/hide CH",
+                  "1 / 2       show/hide CH", "K           cursors/track",
                   "Space       pause", "F12         screenshot", "",
                   "Generator keys (A2):", "G           wave shape",
                   "[ / ]       frequency -/+", "F           type frequency",
-                  "A           type amplitude", "O           type offset", "",
+                  "A           type amplitude", "O           type offset",
+                  "D           draw a wave", "",
                   "Pins:", "A0 = CH1 / volts / ohms", "A1 = CH2",
                   "D3 = frequency counter", "A3 = continuity probe",
                   "A2 = GENERATOR output", "D12 = 2 kHz square"]
@@ -535,9 +757,13 @@ class Window:
                 if event.type == pygame.QUIT:
                     return
                 if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE and self.entry is None:
+                    if event.key == pygame.K_ESCAPE and self.entry is None \
+                            and self.drawing is None:
                         return
                     self.key(event)
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                                  pygame.MOUSEMOTION):
+                    self.mouse(event)
 
             buffer += self.link.read(self.link.in_waiting or 1)
             now = pygame.time.get_ticks()
@@ -545,12 +771,16 @@ class Window:
                 self.packet_times.append(now)
                 self.check_generator(packet)
                 expected = RATES[METER_RATE if self.meter_mode else self.rate_index]
+                if packet["rate"] != expected and now - self.rate_sent_ms > 1000:
+                    self.send_rate()        # our rate byte got lost: again
                 if not self.paused and packet["rate"] == expected:
                     self.new_packet(packet)
             self.packet_times = [t for t in self.packet_times if now - t < 2000]
 
             self.screen.fill(BLACK)
-            if self.meter_mode:
+            if self.drawing is not None:
+                self.draw_canvas()
+            elif self.meter_mode:
                 self.draw_meter(self.packet)
             else:
                 self.draw_scope(self.view)
