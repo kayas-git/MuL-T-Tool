@@ -1,0 +1,13 @@
+# Build output and IDE files
+Scope/Debug/
+Scope/Release/
+.metadata/
+.settings/
+*.launch
+
+# Python
+__pycache__/
+*.pyc
+
+# Screenshots taken with F12 in the window (docs/screenshot.png is kept)
+pc_app/screenshot.png
