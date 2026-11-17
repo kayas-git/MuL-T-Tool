@@ -22,7 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "scope.h"
-#include "test_signals.h"
+#include "generator.h"
 
 /* USER CODE END Includes */
 
@@ -124,8 +124,9 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
-  test_signals_start();   /* sine on A2, square on D12 */
   scope_init();
+  generator_start(scope_measure_vdda_mv());   /* 1 kHz sine on A2 */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);   /* fixed 2 kHz square on D12 */
 
   /* USER CODE END 2 */
 
@@ -660,7 +661,7 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  if (HAL_UARTEx_EnableFifoMode(&huart2) != HAL_OK)
   {
     Error_Handler();
   }

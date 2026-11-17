@@ -6,14 +6,16 @@
  *   2. measure the chip's supply voltage with ADC5 and the built-in
  *      reference (this makes the voltages accurate),
  *   3. read the frequency counter (TIM2) and the continuity pin,
- *   4. send one packet to the PC.
+ *   4. send one packet to the PC (it includes the generator's settings).
  * The PC window does the rest (trigger, drawing, multimeter numbers).
  *
- * The PC changes the sample rate by sending one byte: an index into
- * RATES[] below.
+ * The PC sends us two kinds of messages:
+ *   - one byte 0..10: the new sample rate (an index into RATES[] below),
+ *   - 'G' + 10 bytes: new generator settings (see HAL_UART_RxCpltCallback).
  */
 #include "main.h"
 #include "scope.h"
+#include "generator.h"
 
 extern ADC_HandleTypeDef hadc1, hadc2, hadc5;
 extern TIM_HandleTypeDef htim2, htim6;
@@ -52,6 +54,9 @@ static uint16_t ch2[SAMPLES];             /* filled by DMA from ADC2 */
 static volatile int adcs_done;            /* +1 when an ADC's DMA finishes */
 static volatile uint8_t rate_index = 5;   /* start at 50 000 samples/s */
 static uint8_t rx_byte;                   /* last byte received from the PC */
+static uint8_t command[10];               /* the 10 bytes after a 'G' */
+static volatile uint8_t receiving_command;   /* 1 = waiting for those 10 */
+static volatile uint8_t command_ready;       /* 1 = command[] is complete */
 
 static uint32_t period_ticks, high_ticks; /* frequency counter results */
 static uint32_t last_edge_ms;             /* when it last saw a signal */
@@ -82,9 +87,21 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   adcs_done++;              /* the DMA has filled ch1 or ch2 */
 }
 
+/* Generator command from the PC (11 bytes, numbers low byte first):
+ *   'G'  wave (1 byte)  frequency Hz (4)  amplitude mV (2)  offset mV (2)
+ *   check (1 byte) = the 9 bytes after 'G' added up (only the low 8 bits)
+ * This runs in an interrupt, so it only stores the bytes. scope_run()
+ * applies them later. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (rx_byte < RATE_COUNT) {
+  if (receiving_command) {
+    receiving_command = 0;
+    command_ready = 1;      /* all 10 bytes after 'G' have arrived */
+  } else if (rx_byte == 'G') {
+    receiving_command = 1;  /* receive the next 10 bytes into command[] */
+    HAL_UART_Receive_IT(huart, command, sizeof(command));
+    return;
+  } else if (rx_byte < RATE_COUNT) {
     rate_index = rx_byte;   /* the PC chose a new sample rate */
   }
   HAL_UART_Receive_IT(huart, &rx_byte, 1);    /* wait for the next byte */
@@ -92,7 +109,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
+  receiving_command = 0;                      /* forget a half command */
   HAL_UART_Receive_IT(huart, &rx_byte, 1);    /* just start listening again */
+}
+
+static uint32_t get16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+static uint32_t get32(const uint8_t *p) { return get16(p) | (get16(p + 2) << 16); }
+
+/* If a complete generator command arrived, check it and use it. */
+static void apply_command(void)
+{
+  if (!command_ready) {
+    return;
+  }
+  uint8_t c[10];
+  for (int i = 0; i < 10; i++) {
+    c[i] = command[i];      /* copy it, then the next one may come in */
+  }
+  command_ready = 0;
+
+  uint8_t check = 0;
+  for (int i = 0; i < 9; i++) {
+    check += c[i];
+  }
+  if (check != c[9]) {
+    return;                 /* damaged on the way: ignore it */
+  }
+  generator_set(c[0], get32(c + 1), get16(c + 5), get16(c + 7));
 }
 
 /* ---------- 1. capture both channels ---------- */
@@ -146,7 +189,7 @@ static int capture(uint8_t index)
  * At the factory, ST measured it with a 3.0 V supply and stored the
  * reading in memory at VREFINT_CAL_ADDR. If we read a smaller number now,
  * our supply is higher than 3.0 V, and so on. Result in millivolts. */
-static uint32_t measure_vdda_mv(void)
+uint32_t scope_measure_vdda_mv(void)
 {
   uint32_t sum = 0;
   for (int i = 0; i < 16; i++) {            /* average 16 readings */
@@ -187,7 +230,15 @@ static void read_frequency_counter(void)
  *  14  4 bytes  frequency counter high time, in 170 MHz ticks
  *  18  1 byte   continuity: 1 = probe A3 touches GND
  *  19  1 byte   packet counter
- *  20  SAMPLES x 2 bytes  channel 1 (A0), 0..4095
+ *  The generator on A2 (see generator.h):
+ *  20  1 byte   wave: 0 sine, 1 square, 2 triangle, 3 sawtooth
+ *  21  1 byte   table points (GEN_POINTS)
+ *  22  4 bytes  frequency asked for, Hz
+ *  26  2 bytes  TIM7 prescaler PSC
+ *  28  2 bytes  TIM7 period ARR  (real frequency = 170 MHz/(PSC+1)/(ARR+1)/points)
+ *  30  2 bytes  amplitude, mV peak to peak
+ *  32  2 bytes  offset (middle level), mV
+ *  34  SAMPLES x 2 bytes  channel 1 (A0), 0..4095
  *      SAMPLES x 2 bytes  channel 2 (A1), 0..4095
  *  end 2 bytes  checksum: sum of all bytes after the start marker
  */
@@ -207,8 +258,9 @@ static uint16_t sum_bytes(const void *data, int length)
 static void send_packet(uint32_t rate, uint32_t vdda_mv, uint8_t continuity)
 {
   static uint8_t counter;
-  uint8_t header[20];
+  uint8_t header[34];
   uint8_t checksum[2];
+  const GeneratorSettings *gen = generator_settings();
 
   header[0] = 0xA5;
   header[1] = 0x5A;
@@ -219,6 +271,13 @@ static void send_packet(uint32_t rate, uint32_t vdda_mv, uint8_t continuity)
   put32(header + 14, high_ticks);
   header[18] = continuity;
   header[19] = counter++;
+  header[20] = gen->wave;
+  header[21] = GEN_POINTS;
+  put32(header + 22, gen->freq_hz);
+  put16(header + 26, gen->prescaler);
+  put16(header + 28, gen->period);
+  put16(header + 30, gen->amplitude_mv);
+  put16(header + 32, gen->offset_mv);
 
   /* The STM32 stores uint16_t low byte first, so ch1/ch2 can be sent as is. */
   uint16_t sum = sum_bytes(header + 2, sizeof(header) - 2)
@@ -235,11 +294,12 @@ static void send_packet(uint32_t rate, uint32_t vdda_mv, uint8_t continuity)
 
 void scope_run(void)
 {
+  apply_command();          /* new generator settings from the PC? */
   uint8_t index = rate_index;
   if (!capture(index)) {
     return;                 /* the PC changed the rate: start again */
   }
-  uint32_t vdda_mv = measure_vdda_mv();
+  uint32_t vdda_mv = scope_measure_vdda_mv();
   read_frequency_counter();
   /* The pull-up keeps A3 high. Touching GND through a wire pulls it low. */
   uint8_t continuity =

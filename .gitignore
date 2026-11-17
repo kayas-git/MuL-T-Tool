@@ -1,6 +1,6 @@
 # Build output and IDE files
-Scope/Debug/
-Scope/Release/
+FuncGen/Debug/
+FuncGen/Release/
 .metadata/
 .settings/
 *.launch

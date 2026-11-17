@@ -1,19 +1,22 @@
-"""scope_window.py - the PC screen of the NUCLEO-G474RE oscilloscope and
-multimeter.
+"""funcgen_window.py - the PC screen of the NUCLEO-G474RE function
+generator (+ oscilloscope and multimeter, to watch what it makes).
 
-The board measures and sends packets (about 10 to 90 per second). This
-script only:
+The board makes a wave on A2, measures and sends packets (about 10 to 90
+per second). This script only:
   1. finds the board's COM port,
-  2. reads the packets (2 channels of samples + multimeter readings),
-  3. draws them: an oscilloscope screen, or big multimeter numbers,
-  4. sends the chosen sample rate to the board (one byte).
+  2. reads the packets (2 channels of samples + multimeter readings +
+     the generator's settings),
+  3. draws them: an oscilloscope screen, or big multimeter numbers, and
+     the generator's settings with its real frequency,
+  4. sends the chosen sample rate (one byte) and generator settings
+     ('G' + 10 bytes) to the board.
 
 INPUTS: 0 V to 3.3 V ONLY. Never connect mains, car or other batteries,
 or anything negative. That can destroy the board and your PC's USB port.
 
-Run:  py scope_window.py              (finds the board by itself)
-      py scope_window.py --port COM4
-      py scope_window.py --rref 4700   (known resistor for the Ω meter)
+Run:  py funcgen_window.py              (finds the board by itself)
+      py funcgen_window.py --port COM4
+      py funcgen_window.py --rref 4700   (known resistor for the Ω meter)
 """
 
 import argparse
@@ -25,10 +28,16 @@ import pygame
 import serial
 from serial.tools import list_ports
 
-BAUD = 4250000                # must match USART2 in the board's Scope.ioc
+BAUD = 4250000                # must match USART2 in the board's FuncGen.ioc
 START = b"\xA5\x5A"           # every packet starts with these 2 bytes
-HEADER = 20                   # bytes before the samples (see scope.c)
-TIMER_HZ = 170_000_000        # TIM2 (frequency counter) counts this fast
+HEADER = 34                   # bytes before the samples (see scope.c)
+TIMER_HZ = 170_000_000        # TIM2 (frequency counter) and TIM7 count this fast
+
+# The generator (generator.h). The PC uses the same limits as the board.
+WAVES = ["sine", "square", "triangle", "sawtooth"]
+GEN_MIN_HZ, GEN_MAX_HZ, GEN_MAX_V = 1, 10000, 3.3
+GEN_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+GEN_COLOR = (120, 255, 140)
 
 # The board's sample rates (RATES[] in scope.c). We send the index.
 RATES = [1000, 2500, 5000, 10000, 25000, 50000,
@@ -43,7 +52,7 @@ GW, GH = DIV_X * DIVS_X, DIV_Y * DIVS_Y
 SHOWN = 500                               # samples across the screen
 PRE_TRIGGER = 100                         # samples shown before the trigger (20 %)
 AFTER_TRIGGER = SHOWN - PRE_TRIGGER       # samples shown from the trigger on
-WIDTH, HEIGHT = GX + GW + 280, GY + GH + 110
+WIDTH, HEIGHT = GX + GW + 280, GY + GH + 190
 
 # Trigger modes, like a real oscilloscope (Tab switches between them):
 #   Auto   - draw every capture; use the trigger when there is one.
@@ -77,8 +86,9 @@ def read_packets(buffer):
         if len(buffer) - start < HEADER:
             del buffer[:start]
             return packets                  # wait for the rest
-        rate, n, vdda_mv, period, high, continuity, counter = \
-            struct.unpack_from("<IHHIIBB", buffer, start + 2)
+        rate, n, vdda_mv, period, high, continuity, counter, \
+            wave, points, freq, psc, arr, amp_mv, offset_mv = \
+            struct.unpack_from("<IHHIIBBBBIHHHH", buffer, start + 2)
         size = HEADER + 4 * n + 2
         if n > 5000:                        # nonsense: not a real packet
             del buffer[:start + 1]
@@ -102,6 +112,9 @@ def read_packets(buffer):
             "duty": 100 * high / period if period else 0.0,
             "continuity": bool(continuity),
             "counter": counter,             # +1 for every packet the board sends
+            "gen": {"wave": wave, "freq": freq, "amp": amp_mv / 1000,
+                    "offset": offset_mv / 1000, "psc": psc, "arr": arr,
+                    "points": points},
         })
         del buffer[:start + size]
 
@@ -187,6 +200,22 @@ def resistance(volts, vdda, r_known):
     return nice(r, "Ω"), ""
 
 
+def real_frequency(gen):
+    """The frequency the board really makes (generator.c):
+         170 MHz / (PSC + 1) / (ARR + 1) / table points
+    Also returns the DAC's speed: values per second."""
+    values_per_s = TIMER_HZ / ((gen["psc"] + 1) * (gen["arr"] + 1))
+    return values_per_s / gen["points"], values_per_s
+
+
+def generator_command(wave, freq, amp, offset):
+    """The 11 bytes that change the generator (see scope.c):
+    'G', wave, frequency Hz (4 bytes), amplitude mV (2), offset mV (2),
+    check = the 9 bytes after 'G' added up (low 8 bits)."""
+    body = struct.pack("<BIHH", wave, freq, round(amp * 1000), round(offset * 1000))
+    return b"G" + body + bytes([sum(body) & 0xFF])
+
+
 def make_beep():
     """A 1 kHz tone to loop while the continuity probe touches GND."""
     pygame.mixer.init(44100, -16, 1)
@@ -200,7 +229,7 @@ class Window:
         self.link = link
         self.r_known = r_known              # known resistor for the Ω meter
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("NUCLEO scope + multimeter")
+        pygame.display.set_caption("NUCLEO function generator + scope + multimeter")
         self.font = pygame.font.SysFont("consolas", 16)
         self.big = pygame.font.SysFont("consolas", 56, bold=True)
         self.beep = make_beep()
@@ -220,6 +249,11 @@ class Window:
         self.view = None                    # what the scope screen shows
         self.found_trigger = False          # did the newest packet trigger?
         self.packet_times = []
+        # Generator settings we want. None until the first packet tells us
+        # what the board is doing now.
+        self.gen = None
+        self.gen_sent_ms = 0                # when we last sent them
+        self.entry = None                   # typing a number: ("F", "440")
         self.send_rate()
 
     # ---- talking to the board ----
@@ -227,9 +261,72 @@ class Window:
         index = METER_RATE if self.meter_mode else self.rate_index
         self.link.write(bytes([index]))
 
+    def send_generator(self):
+        g = self.gen
+        self.link.write(generator_command(g["wave"], g["freq"], g["amp"], g["offset"]))
+        self.gen_sent_ms = pygame.time.get_ticks()
+
+    def check_generator(self, packet):
+        """Take over the board's settings at the start. Later, if the board
+        does not show ours (a lost command, or the board was reset), send
+        them again, at most once a second."""
+        board = packet["gen"]
+        if self.gen is None:
+            self.gen = {k: board[k] for k in ("wave", "freq", "amp", "offset")}
+        elif any(abs(self.gen[k] - board[k]) > 0.0005 for k in self.gen) \
+                and pygame.time.get_ticks() - self.gen_sent_ms > 1000:
+            self.send_generator()
+
+    def change_generator(self, **changes):
+        if self.gen is None:
+            return                          # no packet yet: we don't know it
+        self.gen.update(changes)
+        self.send_generator()
+
+    # ---- typing a number (F, A, O) ----
+    ENTRY_TEXT = {"F": f"frequency in Hz ({GEN_MIN_HZ} .. {GEN_MAX_HZ})",
+                  "A": f"amplitude in volts peak-to-peak (0 .. {GEN_MAX_V})",
+                  "O": f"offset (middle level) in volts (0 .. {GEN_MAX_V})"}
+
+    def entry_key(self, event):
+        what, text = self.entry
+        if event.key == pygame.K_ESCAPE:
+            self.entry = None               # cancel
+        elif event.key == pygame.K_BACKSPACE:
+            self.entry = (what, text[:-1])
+        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.entry = None
+            try:
+                value = float(text)
+            except ValueError:
+                return                      # nothing (or nonsense) typed
+            if what == "F":
+                freq = round(min(max(value, GEN_MIN_HZ), GEN_MAX_HZ))
+                self.change_generator(freq=freq)
+            elif what == "A":                 # (round to mV, like the board)
+                self.change_generator(amp=round(min(max(value, 0.0), GEN_MAX_V), 3))
+            else:
+                self.change_generator(offset=round(min(max(value, 0.0), GEN_MAX_V), 3))
+        elif event.unicode and event.unicode in "0123456789." and len(text) < 8:
+            self.entry = (what, text + event.unicode)
+
     # ---- keyboard ----
-    def key(self, k):
-        if k == pygame.K_m:
+    def key(self, event):
+        if self.entry is not None:          # typing a number: keys go there
+            self.entry_key(event)
+            return
+        k = event.key
+        if k == pygame.K_g and self.gen:    # next wave shape
+            self.change_generator(wave=(self.gen["wave"] + 1) % len(WAVES))
+        elif k == pygame.K_RIGHTBRACKET and self.gen:   # next step up
+            higher = [f for f in GEN_STEPS if f > self.gen["freq"]]
+            self.change_generator(freq=higher[0] if higher else GEN_MAX_HZ)
+        elif k == pygame.K_LEFTBRACKET and self.gen:    # next step down
+            lower = [f for f in GEN_STEPS if f < self.gen["freq"]]
+            self.change_generator(freq=lower[-1] if lower else GEN_MIN_HZ)
+        elif k in (pygame.K_f, pygame.K_a, pygame.K_o) and self.gen:
+            self.entry = (pygame.key.name(k).upper(), "")
+        elif k == pygame.K_m:
             self.meter_mode = not self.meter_mode
             self.send_rate()
         elif k == pygame.K_LEFT and self.rate_index < len(RATES) - 1:
@@ -374,6 +471,30 @@ class Window:
             self.text(label, GX + 20, GY + 5 + i * 95)
             self.text(value, GX + 20, GY + 25 + i * 95, color, self.big)
 
+    def draw_generator(self, p):
+        """Three lines under the screen: the generator's settings, its real
+        frequency (and how it is made), and the typing prompt."""
+        x, y = GX, GY + GH + 72
+        if p is None:
+            return
+        g = p["gen"]
+        real, values_per_s = real_frequency(g)
+        error = 100 * (real - g["freq"]) / g["freq"]
+        low, high = g["offset"] - g["amp"] / 2, g["offset"] + g["amp"] / 2
+        clipped = ""
+        if low < 0 or high > p["vdda"]:
+            clipped = f"  CLIPPED (the DAC can only do 0 .. {p['vdda']:.2f} V)"
+        self.text(f"GENERATOR (A2): {WAVES[g['wave']].upper()}  {g['amp']:.2f} Vpp"
+                  f"  offset {g['offset']:.2f} V{clipped}", x, y, GEN_COLOR)
+        self.text(f"asked {g['freq']} Hz, real {real:.6g} Hz ({error:+.3f} %)"
+                  f"   DAC: {nice(values_per_s, 'values/s')}", x, y + 20, GEN_COLOR)
+        self.text(f"real = 170 MHz / (PSC+1) / (ARR+1) / points = 170 MHz / "
+                  f"{g['psc'] + 1} / {g['arr'] + 1} / {g['points']}", x, y + 40, GEN_COLOR)
+        if self.entry is not None:
+            what, text = self.entry
+            self.text(f"Type the {self.ENTRY_TEXT[what]}, Enter = OK, Esc = cancel:  "
+                      f"{text}_", x, y + 62, (255, 255, 0))
+
     def draw_panel(self, p):
         x, y = GX + GW + 25, GY
         self.text("MULTIMETER" if self.meter_mode else "OSCILLOSCOPE", x, y, CH_COLORS[0])
@@ -388,9 +509,12 @@ class Window:
                   "S           arm Single", "C           clear screen",
                   "1 / 2       show/hide CH",
                   "Space       pause", "F12         screenshot", "",
+                  "Generator keys (A2):", "G           wave shape",
+                  "[ / ]       frequency -/+", "F           type frequency",
+                  "A           type amplitude", "O           type offset", "",
                   "Pins:", "A0 = CH1 / volts / ohms", "A1 = CH2",
                   "D3 = frequency counter", "A3 = continuity probe",
-                  "", "Test signals out:", "A2  = 1 kHz sine", "D12 = 2 kHz square"]
+                  "A2 = GENERATOR output", "D12 = 2 kHz square"]
         for i, line in enumerate(lines):
             self.text(line, x, y + 26 + i * 19, GREY)
         self.text(WARNING, GX, HEIGHT - 26, RED)
@@ -411,14 +535,15 @@ class Window:
                 if event.type == pygame.QUIT:
                     return
                 if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+                    if event.key == pygame.K_ESCAPE and self.entry is None:
                         return
-                    self.key(event.key)
+                    self.key(event)
 
             buffer += self.link.read(self.link.in_waiting or 1)
             now = pygame.time.get_ticks()
             for packet in read_packets(buffer):
                 self.packet_times.append(now)
+                self.check_generator(packet)
                 expected = RATES[METER_RATE if self.meter_mode else self.rate_index]
                 if not self.paused and packet["rate"] == expected:
                     self.new_packet(packet)
@@ -430,6 +555,7 @@ class Window:
             else:
                 self.draw_scope(self.view)
             self.draw_panel(self.packet)
+            self.draw_generator(self.packet)
             pygame.display.flip()
             self.update_beep()
             clock.tick(60)

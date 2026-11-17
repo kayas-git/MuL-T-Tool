@@ -9,7 +9,10 @@
 #ifndef SCOPE_H
 #define SCOPE_H
 
+#include <stdint.h>
+
 void scope_init(void);  /* call once after the CubeMX init functions */
 void scope_run(void);   /* call forever: measure once, send it to the PC */
+uint32_t scope_measure_vdda_mv(void);  /* the real supply voltage, in mV */
 
 #endif
