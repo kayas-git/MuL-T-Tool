@@ -16,6 +16,8 @@ Extras: K shows two time + two voltage cursors (drag them with the mouse);
 press K again for "track" mode, where the voltage cursors follow the wave.
 D lets you draw one period of a "custom" wave with the mouse.
 Y chooses which generator channel the generator keys change.
+Every key also has a clickable button in the right panel; a click simply
+presses that key, so both ways do exactly the same thing.
 
 INPUTS: 0 V to 3.3 V ONLY. Never connect mains, car or other batteries,
 or anything negative. That can destroy the board and your PC's USB port.
@@ -65,7 +67,12 @@ GW, GH = DIV_X * DIVS_X, DIV_Y * DIVS_Y
 SHOWN = 500                               # samples across the screen
 PRE_TRIGGER = 100                         # samples shown before the trigger (20 %)
 AFTER_TRIGGER = SHOWN - PRE_TRIGGER       # samples shown from the trigger on
-WIDTH, HEIGHT = GX + GW + 280, GY + GH + 210
+WIDTH, HEIGHT = GX + GW + 340, GY + GH + 210
+PANEL_X = GX + GW + 25                    # the right-hand panel (buttons)
+
+# On-screen buttons: 2 columns in the right-hand panel.
+BUTTON_W, BUTTON_H, BUTTON_GAP = 150, 21, 4
+BUTTON_COLOR, BUTTON_HOVER = (35, 40, 52), (60, 68, 88)
 
 # Trigger modes, like a real oscilloscope (Tab switches between them):
 #   Auto   - draw every capture; use the trigger when there is one.
@@ -305,6 +312,8 @@ class Window:
         pygame.display.set_caption("NUCLEO function generator + scope + multimeter")
         self.font = pygame.font.SysFont("consolas", 16)
         self.big = pygame.font.SysFont("consolas", 56, bold=True)
+        self.small = pygame.font.SysFont("consolas", 14)
+        self.button_rects = []              # [(rectangle, key)] drawn last frame
         self.beep = make_beep()
         self.beeping = False
         self.meter_mode = False
@@ -475,6 +484,11 @@ class Window:
         if event.type == pygame.MOUSEMOTION and not event.buttons[0]:
             return                          # moving without the button
         x, y = event.pos
+        # A click on a button: press its key, and nothing else (no drawing,
+        # no cursor grab). Only a new click counts, so dragging a cursor
+        # over the buttons does not press them.
+        if event.type == pygame.MOUSEBUTTONDOWN and self.click_button(x, y):
+            return
         if self.drawing is not None:
             self.draw_at(x, y)
             return
@@ -497,6 +511,97 @@ class Window:
                 top = VOLTS_PER_DIV[self.vdiv_index] * DIVS_Y
                 volts = (GY + GH - y) / DIV_Y * VOLTS_PER_DIV[self.vdiv_index]
                 self.cursor_v[n] = min(max(volts, 0.0), top)
+
+    # ---- on-screen buttons ----
+    # Every button is just a key: a click "presses" that key (press_key),
+    # so a button always does exactly what its key does.
+    def buttons(self):
+        """The buttons to show now: a list of (title, [(label, key name,
+        pygame key), ...]). Some labels show the current state."""
+        if self.drawing is not None:        # drawing mode: only its own keys
+            return [("Drawing a wave", [("Send it", "Enter", pygame.K_RETURN),
+                                        ("Flat line", "C", pygame.K_c),
+                                        ("Cancel", "Esc", pygame.K_ESCAPE)])]
+        if self.entry is not None:          # typing a number (digits: keyboard)
+            return [("Typing a number", [("OK", "Enter", pygame.K_RETURN),
+                                         ("Cancel", "Esc", pygame.K_ESCAPE),
+                                         ("Delete digit", "Bksp", pygame.K_BACKSPACE)])]
+        g = self.gen[self.edit] if self.gen else None
+        wave = WAVES[g["wave"]] if g else "?"
+        on = ("ON" if g["on"] else "OFF") if g else "?"
+        coupled = self.pair and self.pair["coupled"]
+        return [
+            ("Mode", [
+                ("Now: meter" if self.meter_mode else "Now: scope", "M", pygame.K_m),
+                ("Paused" if self.paused else "Pause", "Space", pygame.K_SPACE),
+                ("Screenshot", "F12", pygame.K_F12)]),
+            ("Scope", [
+                ("Time/div -", "Left", pygame.K_LEFT),
+                ("Time/div +", "Right", pygame.K_RIGHT),
+                ("Volts/div -", "Up", pygame.K_UP),
+                ("Volts/div +", "Down", pygame.K_DOWN)]),
+            ("Trigger", [
+                ("Level +", "PgUp", pygame.K_PAGEUP),
+                ("Level -", "PgDn", pygame.K_PAGEDOWN),
+                ("Edge: rising" if self.trigger_rising else "Edge: falling", "E", pygame.K_e),
+                (f"Source CH{self.trigger_source + 1}", "T", pygame.K_t),
+                (f"Mode: {self.trigger_mode}", "Tab", pygame.K_TAB),
+                ("Arm single", "S", pygame.K_s),
+                ("Clear screen", "C", pygame.K_c)]),
+            ("View", [
+                (f"CH1 {'shown' if self.visible[0] else 'hidden'}", "1", pygame.K_1),
+                (f"CH2 {'shown' if self.visible[1] else 'hidden'}", "2", pygame.K_2),
+                (f"Cursors {self.cursor_mode}", "K", pygame.K_k)]),
+            (f"Generator (editing CH{self.edit + 1})", [
+                (f"Edit CH{2 - self.edit}", "Y", pygame.K_y),
+                (f"Output {on}", "X", pygame.K_x),
+                (f"Wave {wave}", "G", pygame.K_g),
+                ("Draw wave", "D", pygame.K_d),
+                ("Freq step -", "[", pygame.K_LEFTBRACKET),
+                ("Freq step +", "]", pygame.K_RIGHTBRACKET),
+                ("Type freq", "F", pygame.K_f),
+                ("Type amplitude", "A", pygame.K_a),
+                ("Type offset", "O", pygame.K_o),
+                ("Type CH2 phase", "P", pygame.K_p),
+                ("CH2 coupled" if coupled else "CH2 free", "L", pygame.K_l),
+                ("Align (restart)", "R", pygame.K_r)]),
+        ]
+
+    def press_key(self, k):
+        """Do what key k does, as if it had been pressed on the keyboard."""
+        self.key(pygame.event.Event(pygame.KEYDOWN, key=k, unicode="", mod=0))
+
+    def click_button(self, x, y):
+        """Was (x, y) on a button? Then press its key and say True."""
+        for rect, k in self.button_rects:
+            if rect.collidepoint(x, y):
+                self.press_key(k)
+                return True
+        return False
+
+    def draw_buttons(self, x, y):
+        """Draw the buttons from buttons() at (x, y), 2 per row, each with its
+        label on the left and its key on the right. Remember where they are
+        (button_rects) for click_button(). Returns the y below the last one."""
+        self.button_rects = []
+        mouse = pygame.mouse.get_pos()
+        for title, row in self.buttons():
+            self.text(title, x, y, WHITE, self.small)
+            y += 18
+            for i, (label, key_name, k) in enumerate(row):
+                column, line = i % 2, i // 2
+                rect = pygame.Rect(x + column * (BUTTON_W + BUTTON_GAP),
+                                   y + line * (BUTTON_H + BUTTON_GAP), BUTTON_W, BUTTON_H)
+                hover = rect.collidepoint(mouse)
+                pygame.draw.rect(self.screen, BUTTON_HOVER if hover else BUTTON_COLOR,
+                                 rect, border_radius=4)
+                pygame.draw.rect(self.screen, GRID, rect, 1, border_radius=4)
+                self.text(label, rect.x + 6, rect.y + 3, WHITE, self.small)
+                key_text = self.small.render(key_name, True, GREY)
+                self.screen.blit(key_text, (rect.right - key_text.get_width() - 6, rect.y + 3))
+                self.button_rects.append((rect, k))
+            y += (len(row) + 1) // 2 * (BUTTON_H + BUTTON_GAP) + 4
+        return y
 
     # ---- keyboard ----
     def key(self, event):
@@ -788,30 +893,20 @@ class Window:
                       f"{text}_", x, y + 82, (255, 255, 0))
 
     def draw_panel(self, p):
-        x, y = GX + GW + 25, GY
+        """The right-hand panel: mode, packets/s, supply, the buttons (each
+        shows its keyboard key on the right), and the pins."""
+        x, y = PANEL_X, GY
         self.text("MULTIMETER" if self.meter_mode else "OSCILLOSCOPE", x, y, CH_COLORS[0])
         rate = len(self.packet_times) / 2
-        lines = [f"packets/s: {rate:.0f}"]
-        if p:
-            lines.append(f"supply VDDA: {p['vdda']:.3f} V")
-        lines += ["", "M       scope / meter", "", "Scope keys:",
-                  "Left/Right  time/div", "Up/Down     volts/div",
-                  "PgUp/PgDn   trigger level", "E           trigger edge",
-                  "T           trigger CH1/CH2", "Tab         trigger mode",
-                  "S           arm Single", "C           clear screen",
-                  "1 / 2       show/hide CH", "K           cursors/track",
-                  "Space       pause", "F12         screenshot", "",
-                  f"Generator keys (CH{self.edit + 1}):", "Y           edit CH1/CH2",
-                  "X           output on/off", "G           wave shape",
-                  "[ / ]       frequency -/+", "F           type frequency",
-                  "A           type amplitude", "O           type offset",
-                  "D           draw a wave", "P           type CH2 phase",
-                  "L           CH2 coupling", "R           align (restart)", "",
-                  "Pins:", "A0 = CH1 / volts / ohms", "A1 = CH2",
-                  "D3 = frequency counter", "A3 = continuity probe",
-                  "A2 = generator CH1", "D12 = generator CH2"]
-        for i, line in enumerate(lines):
-            self.text(line, x, y + 26 + i * 17, GREY)
+        vdda = f"   VDDA {p['vdda']:.3f} V" if p else ""
+        self.text(f"packets/s: {rate:.0f}{vdda}", x, y + 22, GREY, self.small)
+        y = self.draw_buttons(x, y + 46)
+        pins = ["Pins: A0 = CH1, volts, ohms  A1 = CH2",
+                "D3 = freq. counter  A3 = continuity",
+                "A2 = gen. CH1      D12 = gen. CH2",
+                "Esc = quit"]
+        for i, line in enumerate(pins):
+            self.text(line, x, y + 4 + i * 17, GREY, self.small)
         self.text(WARNING, GX, HEIGHT - 26, RED)
 
     def update_beep(self):

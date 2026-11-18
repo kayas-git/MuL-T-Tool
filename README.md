@@ -25,10 +25,10 @@ D12 → A1**, you watch the waves you make in the same window.
 
 *(A real screenshot: the generator makes a 500 Hz triangle, 2.5 V peak to
 peak around 1.65 V, and CH1 shows it. The green lines at the bottom are the
-generator panel. The screenshot was taken with a temporary test build that
-connected A2 to the scope inside the chip, because nobody was there to plug
-in the wire. With the normal firmware and the wire A2 → A0 you get the same
-picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
+generator panel; the buttons on the right do the same as the keys. The
+board data was read out through the debugger (the serial port was busy at
+the time) and drawn by this window, so with the wire A2 → A0 you get the
+same picture. [Here is a 300 Hz sawtooth](docs/screenshot_sawtooth.png).)*
 
 ```
  PC: "triangle, 500 Hz, 2.5 V, 1.65 V" ──USB──► board fills a table (100 values)
@@ -184,6 +184,17 @@ the COM port at a time.
 
 ## Controls
 
+**Buttons or keys, your choice.** Every key below also has a button in
+the panel on the right of the window, grouped as Mode, Scope, Trigger,
+View and Generator. Each button says what it does, with its key in grey on
+the right (for example `Wave sine   G`). Click it with the mouse and the
+window does exactly what the key does. Toggle buttons show the current
+state ("Mode: Auto", "Edge: rising", "CH2 shown", "Edit CH2", "Output ON",
+"CH2 coupled"). While you draw a wave the panel shows only **Send it /
+Flat line / Cancel**, and while you type a value it shows **OK / Cancel /
+Delete digit** (type the digits on the keyboard). Esc on the keyboard
+still quits the window; the Cancel button never does.
+
 **Generator** (the green lines under the scope show both channels; `< Y`
 marks the one the keys change)
 
@@ -281,7 +292,8 @@ other waves. For the full 0 … 3.3 V use amplitude 3.3 and offset 1.65.
 
 *(Real screenshot of a drawn "heartbeat", 200 Hz, 3.0 Vpp. Cursors t1/t2
 measure one period: dt = 5 ms, 1/dt = 200 Hz. V1/V2 sit on the bottom and
-the top: dV = 2.78 V. Same temporary test build as the first screenshot.)*
+the top: dV = 2.67 V. Board data read through the debugger, like the first
+screenshot.)*
 
 ### Cursors and automatic measurements
 
@@ -289,7 +301,7 @@ Under the scope, one line per channel is measured from the samples
 on screen:
 
 ```
-CH1: Vpp 2.78  min 0.31  max 3.09  avg 1.169  rms 1.219 V  f 200 Hz (T 5 ms)
+CH1: Vpp 2.67  min 0.37  max 3.04  avg 1.166  rms 1.213 V  f 200 Hz (T 5 ms)
 ```
 
 - **Vpp** = max − min. **avg** = the average (the DC level).
@@ -318,7 +330,7 @@ to measure just that bump.
 
 ![Track mode with max/min markers on a 1 kHz triangle](docs/screenshot_track.png)
 
-*(Track mode on a test triangle, made without the board: V1 / V2 are the
+*(Track mode on a real 1 kHz triangle from the board: V1 / V2 are the
 wave's voltage at t1 / t2, and ▼ / ▲ mark the max and min between them.)*
 
 **Scope and meter** (same as SCOPE)

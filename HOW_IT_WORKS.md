@@ -426,6 +426,23 @@ packet. At 4 250 000 baud a packet takes about 9.5 ms.
   `R_unknown = R_known × V / (VDDA − V)`. `make_beep()` makes the continuity
   tone.
 
+### The buttons (a second way to press the keys)
+
+- `buttons()` returns the list of buttons for the current situation as
+  (label, key name, pygame key). The labels are built every frame, so they
+  can show the state ("Mode: Auto", "Output ON"). While drawing or typing,
+  only the buttons that make sense there are returned.
+- `draw_buttons()` draws them in two columns in the right panel and
+  remembers each button's rectangle. `click_button()` checks those
+  rectangles when the mouse button goes down.
+- A click does **not** have its own code for each action. `press_key()`
+  makes a fake key event and hands it to `key()`, the same function the
+  keyboard uses. So a button and its key can never behave differently, and
+  a new key only needs one extra line in `buttons()`.
+- In `mouse()` the button check comes first, and only for a mouse-down, so
+  a click on a button never starts a cursor drag or draws on the wave, and
+  dragging a cursor over the panel never presses a button.
+
 ## Things we learned the hard way
 
 - **The USART FIFO must be on for the multi-byte commands.** At 4 250 000 baud
